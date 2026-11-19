@@ -110,9 +110,12 @@ public struct MapTile: Sendable {
     public let rect: CGRect
     public let container: Bool
     public let aggregate: Bool
+    public var header: CGFloat = 0
 }
 
 public enum TreemapLayout {
+    public static let headerHeight: CGFloat = 16
+
     public static func make(snapshot: ScanSummary, focus: Int, size: CGSize, options: ViewOptions) throws -> [MapTile] {
         var tiles: [MapTile] = []
         let bounds = CGRect(origin: .zero, size: size)
@@ -132,11 +135,13 @@ public enum TreemapLayout {
     ) throws {
         try Task.checkCancellation()
         let container = id >= 0 && snapshot.isExpandable(id, options: options)
+        let header = depth > 0 && container && rect.width >= 64 && rect.height >= headerHeight + 28 ? headerHeight : 0
         if depth > 0 {
-            tiles.append(MapTile(id: id, rect: rect, container: container, aggregate: false))
+            tiles.append(MapTile(id: id, rect: rect, container: container, aggregate: false, header: header))
         }
         guard container, depth < 24, rect.width >= 6, rect.height >= 6, tiles.count < 12_000 else { return }
-        let inner = depth == 0 ? rect : rect.insetBy(dx: 1, dy: 1)
+        let inner = depth == 0 ? rect
+            : CGRect(x: rect.minX + 1, y: rect.minY + max(1, header), width: rect.width - 2, height: rect.height - max(1, header) - 1)
         let children = snapshot.sortedChildren(of: id, options: options)
         let combined = children.reduce(0.0) { $0 + Double(snapshot.size(of: $1, options: options)) }
         guard combined > 0 else { return }
