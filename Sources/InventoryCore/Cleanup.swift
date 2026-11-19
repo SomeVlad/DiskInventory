@@ -7,9 +7,9 @@ public enum CleanupSafety: String, CaseIterable, Sendable {
 
     public var title: String {
         switch self {
-        case .safe: "Можно удалять"
-        case .regenerable: "Восстановится заново"
-        case .review: "Стоит посмотреть"
+        case .safe: "Safe to Remove"
+        case .regenerable: "Rebuilt on Demand"
+        case .review: "Worth a Look"
         }
     }
 }
@@ -36,44 +36,44 @@ public struct CleanupGroup: Sendable {
 
 public enum CleanupCategories {
     public static let trash = CleanupCategory(
-        id: "trash", title: "Корзина",
-        explanation: "Файлы уже выброшены; место вернётся только после очистки Корзины.", safety: .safe)
+        id: "trash", title: "Trash",
+        explanation: "Already thrown away; the space comes back only when the Trash is emptied.", safety: .safe)
     public static let caches = CleanupCategory(
-        id: "caches", title: "Кэши программ",
-        explanation: "Программы пересоздают кэш сами; первый запуск после удаления может быть медленнее.", safety: .safe)
+        id: "caches", title: "App Caches",
+        explanation: "Apps recreate their caches; the first launch afterwards may be slower.", safety: .safe)
     public static let logs = CleanupCategory(
-        id: "logs", title: "Журналы программ",
-        explanation: "Нужны только для разбора сбоев; программы заводят новые.", safety: .safe)
+        id: "logs", title: "App Logs",
+        explanation: "Only needed to investigate crashes; apps start new ones.", safety: .safe)
     public static let simulatorCaches = CleanupCategory(
-        id: "simulator-caches", title: "Кэши симуляторов Xcode",
-        explanation: "Xcode пересобирает их при следующем запуске симулятора.", safety: .safe)
+        id: "simulator-caches", title: "Simulator Caches",
+        explanation: "Xcode rebuilds them the next time a simulator starts.", safety: .safe)
     public static let derivedData = CleanupCategory(
-        id: "derived-data", title: "DerivedData Xcode",
-        explanation: "Промежуточные файлы сборки; Xcode соберёт проект заново, это займёт время.", safety: .regenerable)
+        id: "derived-data", title: "Xcode DerivedData",
+        explanation: "Intermediate build files; Xcode builds the project again, which takes time.", safety: .regenerable)
     public static let deviceSupport = CleanupCategory(
-        id: "device-support", title: "Символы устройств iOS",
-        explanation: "Xcode скопирует их снова при подключении устройства с этой версией iOS.", safety: .regenerable)
+        id: "device-support", title: "Device Support Files",
+        explanation: "Xcode copies them again when a device with that OS version is connected.", safety: .regenerable)
     public static let toolCaches = CleanupCategory(
-        id: "tool-caches", title: "Кэши пакетных менеджеров",
-        explanation: "npm, pip, Gradle, Cargo и другие скачают пакеты заново при следующей сборке.", safety: .regenerable)
+        id: "tool-caches", title: "Package Manager Caches",
+        explanation: "npm, uv, pip, Gradle, Cargo and others download packages again on the next build.", safety: .regenerable)
     public static let buildArtifacts = CleanupCategory(
-        id: "build-artifacts", title: "Артефакты сборки проектов",
-        explanation: "node_modules, .build, target и подобное восстанавливаются командой установки или сборки проекта.", safety: .regenerable)
+        id: "build-artifacts", title: "Project Build Artifacts",
+        explanation: "node_modules, .build, target, virtual environments: the project's install or build command recreates them.", safety: .regenerable)
     public static let models = CleanupCategory(
-        id: "models", title: "Локальные модели ИИ",
-        explanation: "Скачиваются заново, но это десятки гигабайт трафика; удаляйте те, которыми не пользуетесь.", safety: .review)
+        id: "models", title: "Local AI Models",
+        explanation: "They can be downloaded again, but that is gigabytes of traffic; remove the ones you no longer use.", safety: .review)
     public static let installers = CleanupCategory(
-        id: "installers", title: "Установщики и образы дисков",
-        explanation: "Обычно программа уже установлена, а установщик можно скачать снова.", safety: .review)
+        id: "installers", title: "Installers and Disk Images",
+        explanation: "The app is usually installed already, and the installer can be downloaded again.", safety: .review)
     public static let archives = CleanupCategory(
-        id: "xcode-archives", title: "Архивы Xcode",
-        explanation: "Нужны, чтобы расшифровывать отчёты о сбоях выпущенных сборок; старые можно убрать.", safety: .review)
+        id: "xcode-archives", title: "Xcode Archives",
+        explanation: "Needed to symbolicate crash reports of shipped builds; old ones can go.", safety: .review)
     public static let simulators = CleanupCategory(
-        id: "simulators", title: "Устройства симулятора",
-        explanation: "Данные установленных в симуляторы приложений; неиспользуемые лучше удалять через Xcode.", safety: .review)
+        id: "simulators", title: "Simulator Devices",
+        explanation: "Apps and data installed in simulators; remove unused devices in Xcode's Devices window.", safety: .review)
     public static let deviceBackups = CleanupCategory(
-        id: "device-backups", title: "Резервные копии iPhone и iPad",
-        explanation: "Удаляйте только копии устройств, которых больше нет или которые есть в iCloud.", safety: .review)
+        id: "device-backups", title: "iPhone and iPad Backups",
+        explanation: "Remove only backups of devices you no longer have or that are backed up to iCloud.", safety: .review)
 }
 
 public enum CleanupAnalyzer {
@@ -256,7 +256,7 @@ public enum CloudOffload {
         "Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures",
         "Library/Mobile Documents/com~apple~CloudDocs",
     ]
-    public static let archiveFolder = "Архив с Mac"
+    public static let archiveFolder = "Archived from Mac"
 
     public static func staleFiles(
         in snapshot: ScanSummary, minSize: Int64, olderThanDays days: Double,

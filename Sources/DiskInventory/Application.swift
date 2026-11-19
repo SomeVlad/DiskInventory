@@ -334,6 +334,7 @@ struct VolumePicker: View {
         add(file, "Reveal in Finder", #selector(ScanWindow.revealInFinder), "r")
         add(file, "Get Info", #selector(ScanWindow.inspect), "i")
         add(file, "Move to Trash…", #selector(ScanWindow.moveToTrash), "\u{8}")
+        add(file, "Clean Up…", #selector(ScanWindow.cleanUp), "k", .shift)
 
         let edit = submenu("Edit")
         add(edit, "Cut", #selector(NSText.cut(_:)), "x")

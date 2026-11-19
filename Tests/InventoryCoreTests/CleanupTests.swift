@@ -84,7 +84,7 @@ private func temporaryHome() throws -> URL {
     let file = home.appending(path: "Movies/Trip/clip.mov")
     try makeFile(file)
     let googleDrive = try #require(destinations.last)
-    let expected = drive.appending(path: "Архив с Mac/Movies/Trip/clip.mov")
+    let expected = drive.appending(path: "Archived from Mac/Movies/Trip/clip.mov")
     #expect(CloudOffload.target(for: file, in: googleDrive, home: home).path == expected.path)
     let moved = try CloudOffload.move(file, to: googleDrive, home: home)
     #expect(moved.path == expected.path)

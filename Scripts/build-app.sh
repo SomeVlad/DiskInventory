@@ -14,7 +14,8 @@ swift Scripts/Icon.swift "$app/Contents/Resources/Inventory.icns"
 sips -g format "$app/Contents/Resources/Inventory.icns"
 cp Resources/Info.plist "$app/Contents/Info.plist"
 cp "$binary_dir/DiskInventory" "$app/Contents/MacOS/DiskInventory"
-codesign --force --sign - "$app"
+identity=$(security find-identity -v -p codesigning | awk '/\)/ {print $2; exit}')
+codesign --force --sign "${identity:--}" "$app"
 codesign --verify --strict "$app"
 plutil -lint "$app/Contents/Info.plist"
 test "$(lipo -archs "$app/Contents/MacOS/DiskInventory")" = arm64

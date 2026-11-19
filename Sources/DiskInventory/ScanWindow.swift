@@ -50,6 +50,7 @@ import InventoryCore
     private let issues = NSButton(title: "Scan Issues", target: nil, action: nil)
     private var rescanningSelection: URL?
     private var isTrashing = false
+    private var cleanup: CleanupWindowController?
     private var deferredSettings = false
     private var closed = false
     var onClose: ((ScanWindow) -> Void)?
@@ -831,6 +832,58 @@ import InventoryCore
         }
     }
 
+    @objc func cleanUp() {
+        guard let snapshot, scanWorker == nil, !isTrashing else { return }
+        if let window = cleanup?.window, window.isVisible {
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+        let controller = CleanupWindowController(snapshot: snapshot, title: location.lastPathComponent) { [weak self] removed, refreshed in
+            await self?.applyCleanup(removed: removed, refreshed: refreshed)
+        }
+        cleanup = controller
+        controller.showWindow(nil)
+    }
+
+    private func applyCleanup(removed: [URL], refreshed: [URL]) async -> ScanSummary? {
+        guard let current = snapshot, scanWorker == nil, !isTrashing, !closed else { return snapshot }
+        let zoomURL = current.url(for: zoom)
+        let stackURLs = stack.map { current.url(for: $0) }
+        let selectedURL = selected.flatMap { $0 >= 0 ? current.url(for: $0) : nil }
+        isTrashing = true
+        status.stringValue = "Updating after cleanup…"
+        progress.startAnimation(nil)
+        window?.toolbar?.validateVisibleItems()
+        let result = await Task.detached(priority: .userInitiated) { () throws -> ScanSummary in
+            var summary = current
+            for url in removed {
+                if let id = summary.locate(url.path), id > 0 { summary = try InventoryScanner.removing(id, from: summary) }
+            }
+            for url in refreshed {
+                if let id = summary.locate(url.path), id > 0 { summary = try InventoryScanner.refresh(id, in: summary) }
+            }
+            return summary
+        }.result
+        isTrashing = false
+        progress.stopAnimation(nil)
+        window?.toolbar?.validateVisibleItems()
+        guard !closed else { return nil }
+        defer { applyDeferredSettings() }
+        switch result {
+        case let .success(summary):
+            snapshot = summary
+            zoom = summary.find(zoomURL) ?? 0
+            stack = stackURLs.compactMap(summary.find)
+            selected = selectedURL.flatMap(summary.find)
+            renderAll(reusePalette: true)
+            return summary
+        case let .failure(error):
+            updateStatus()
+            present(error)
+            return snapshot
+        }
+    }
+
     @discardableResult
     private func trash(_ url: URL, parent: URL, node: FileNode, id: Int) -> Task<URL?, Error>? {
         guard !closed, !isTrashing, scanWorker == nil else { return nil }
@@ -925,6 +978,7 @@ import InventoryCore
         case #selector(refreshSelection): return selectedURL != nil && scanWorker == nil && !isTrashing
         case #selector(refreshAll): return scanWorker == nil && !isTrashing
         case #selector(moveToTrash): return (selected ?? 0) > 0 && scanWorker == nil && !isTrashing
+        case #selector(cleanUp): return snapshot != nil && scanWorker == nil && !isTrashing
         case #selector(findFiles), #selector(toggleList): return snapshot != nil
         case #selector(findNext): return details.hasMatches
         case #selector(scrollToSelection): return selected != nil
@@ -934,6 +988,7 @@ import InventoryCore
 
     func windowWillClose(_ notification: Notification) {
         closed = true
+        cleanup?.close()
         files.cancelSorting()
         scanWorker?.cancel()
         whileScanning?.cancel()
@@ -954,7 +1009,8 @@ import InventoryCore
         ("info", "Get Info", "info.circle", #selector(inspect)),
         ("search", "Find", "magnifyingglass", #selector(findFiles)),
         ("details", "Toggle Inspector", "sidebar.right", #selector(toggleDetails)),
-        ("trash", "Move to Trash", "trash", #selector(moveToTrash))
+        ("trash", "Move to Trash", "trash", #selector(moveToTrash)),
+        ("cleanup", "Clean Up", "checklist", #selector(cleanUp))
     ]
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
@@ -962,7 +1018,7 @@ import InventoryCore
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        ["zoomOut", "zoomIn", "refresh", "reveal", "info"].map { .init($0) } + [.flexibleSpace, .init("search"), .init("details")]
+        ["zoomOut", "zoomIn", "refresh", "reveal", "info", "cleanup"].map { .init($0) } + [.flexibleSpace, .init("search"), .init("details")]
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {

@@ -2,37 +2,79 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleDevelopmentRegion</key><string>en</string>
-    <key>CFBundleDisplayName</key><string>Disk Inventory</string>
-    <key>CFBundleExecutable</key><string>DiskInventory</string>
-    <key>CFBundleIconFile</key><string>Inventory.icns</string>
-    <key>CFBundleIdentifier</key><string>local.diskinventory.app</string>
-    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-    <key>CFBundleName</key><string>Disk Inventory</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.5</string>
-    <key>CFBundleVersion</key><string>6</string>
-    <key>LSMinimumSystemVersion</key><string>26.0</string>
-    <key>NSHighResolutionCapable</key><true/>
-    <key>NSDocumentsFolderUsageDescription</key><string>Disk Inventory reads file sizes and metadata in folders you choose to scan.</string>
-    <key>NSDownloadsFolderUsageDescription</key><string>Disk Inventory reads file sizes and metadata in folders you choose to scan.</string>
-    <key>NSDesktopFolderUsageDescription</key><string>Disk Inventory reads file sizes and metadata in folders you choose to scan.</string>
-    <key>NSNetworkVolumesUsageDescription</key><string>Disk Inventory reads file sizes and metadata on volumes you choose to scan.</string>
-    <key>NSRemovableVolumesUsageDescription</key><string>Disk Inventory reads file sizes and metadata on volumes you choose to scan.</string>
-    <key>CFBundleDocumentTypes</key>
-    <array><dict>
-        <key>CFBundleTypeName</key><string>Folder or Volume</string>
-        <key>CFBundleTypeRole</key><string>Viewer</string>
-        <key>LSHandlerRank</key><string>Alternate</string>
-        <key>LSItemContentTypes</key><array><string>public.folder</string><string>public.volume</string></array>
-    </dict></array>
-    <key>NSServices</key>
-    <array><dict>
-        <key>NSMenuItem</key><dict><key>default</key><string>Scan with Disk Inventory</string></dict>
-        <key>NSMessage</key><string>scanSelection</string>
-        <key>NSPortName</key><string>Disk Inventory</string>
-        <key>NSSendTypes</key><array><string>public.file-url</string><string>NSFilenamesPboardType</string></array>
-        <key>NSRequiredContext</key><dict><key>NSApplicationIdentifier</key><string>com.apple.finder</string></dict>
-    </dict></array>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Disk Inventory</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Folder or Volume</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.folder</string>
+				<string>public.volume</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleExecutable</key>
+	<string>DiskInventory</string>
+	<key>CFBundleIconFile</key>
+	<string>Inventory.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.diskinventory.app</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Disk Inventory</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.6</string>
+	<key>CFBundleVersion</key>
+	<string>7</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Disk Inventory reads file sizes and metadata in folders you choose to scan.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Disk Inventory reads file sizes and metadata in folders you choose to scan.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Disk Inventory reads file sizes and metadata in folders you choose to scan.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Disk Inventory reads file sizes and metadata on volumes you choose to scan.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Disk Inventory reads file sizes and metadata on volumes you choose to scan.</string>
+	<key>NSServices</key>
+	<array>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>Scan with Disk Inventory</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>scanSelection</string>
+			<key>NSPortName</key>
+			<string>Disk Inventory</string>
+			<key>NSRequiredContext</key>
+			<dict>
+				<key>NSApplicationIdentifier</key>
+				<string>com.apple.finder</string>
+			</dict>
+			<key>NSSendTypes</key>
+			<array>
+				<string>public.file-url</string>
+				<string>NSFilenamesPboardType</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>
