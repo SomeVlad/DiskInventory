@@ -19,15 +19,15 @@ struct VolumePicker: View {
     @State private var selection: URL?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 13) {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 12) {
                 Image(nsImage: NSApp.applicationIconImage)
                     .resizable()
-                    .frame(width: 53, height: 53)
+                    .frame(width: 48, height: 48)
                     .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: 4) {
                     Text("Disk Inventory").font(.title2.weight(.semibold))
-                    Text("Choose a volume or folder to scan.")
+                    Text("Choose a volume or folder to scan")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -37,18 +37,19 @@ struct VolumePicker: View {
             }
             List(selection: $selection) {
                 ForEach(volumes) { volume in
-                    HStack(spacing: 11) {
+                    let low = volume.usage.map { $0.capacity > 0 && Double($0.free) / Double($0.capacity) < 0.1 } ?? false
+                    HStack(spacing: 12) {
                         Image(systemName: volume.url.path == "/" ? "internaldrive.fill" : "externaldrive")
                             .font(.system(size: 22, weight: .light))
-                            .frame(width: 29)
+                            .frame(width: 32)
                             .foregroundStyle(.secondary)
-                        VStack(alignment: .leading, spacing: 5) {
+                        VStack(alignment: .leading, spacing: 4) {
                             Text(volume.name).font(.body.weight(.medium))
                             if let usage = volume.usage, usage.capacity > 0 {
                                 ProgressView(value: Double(max(0, usage.capacity - usage.free)), total: Double(usage.capacity))
-                                    .tint(.accentColor)
+                                    .tint(low ? .orange : .secondary)
                                     .accessibilityLabel("Space used")
-                                Text("\(formatSize(usage.free)) free of \(formatSize(usage.capacity))")
+                                Text("\(formatSize(usage.free)) free of \(formatSize(usage.capacity))\(low ? " · almost full" : "")")
                                     .foregroundStyle(.secondary)
                                     .font(.caption)
                             } else {
@@ -56,27 +57,28 @@ struct VolumePicker: View {
                             }
                         }
                     }
-                    .padding(.vertical, 5)
-                    .contentShape(Rectangle())
-                    .onTapGesture(count: 2) { open(volume.url) }
+                    .padding(.vertical, 4)
                     .tag(volume.url)
                 }
             }
             .listStyle(.bordered)
             .accessibilityLabel("Mounted volumes")
+            .contextMenu(forSelectionType: URL.self) { _ in
+                EmptyView()
+            } primaryAction: { urls in
+                if let url = urls.first { open(url) }
+            }
             HStack {
                 Button("Open Folder…", action: choose)
                 Spacer()
                 Button(selection.map(openScans.contains) == true ? "Show Scan" : "Scan Volume") {
                     if let selection { open(selection) }
                 }
-                    .keyboardShortcut(.defaultAction)
                     .disabled(selection == nil)
             }
         }
-        .padding(20)
+        .padding(16)
         .frame(minWidth: 480, minHeight: 330)
-        .onAppear { selection = volumes.first?.url }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
@@ -286,28 +288,41 @@ struct VolumePicker: View {
 
     @objc private func showPreferences() {
         if preferences == nil {
-            let window = NSWindow(contentViewController: NSHostingController(rootView: PreferencesView().defaultAppStorage(Settings.store)))
+            let tabs = NSTabViewController()
+            tabs.tabStyle = .toolbar
+            for page in PreferencesPage.allCases {
+                let controller = NSHostingController(rootView: page.view.defaultAppStorage(Settings.store))
+                controller.sizingOptions = .preferredContentSize
+                let item = NSTabViewItem(viewController: controller)
+                item.label = page.title
+                item.image = NSImage(systemSymbolName: page.symbol, accessibilityDescription: page.title)
+                tabs.addTabViewItem(item)
+            }
+            tabs.selectedTabViewItemIndex = min(Settings.store.integer(forKey: "preferencesTab"), PreferencesPage.allCases.count - 1)
+            let window = NSWindow(contentViewController: tabs)
             window.title = "Disk Inventory Settings"
             window.isReleasedWhenClosed = false
             window.styleMask = [.titled, .closable]
+            window.toolbarStyle = .preference
             window.center()
             preferences = window
         }
         preferences?.makeKeyAndOrderFront(nil)
     }
 
+    private var helpWindow: NSWindow?
+
     @objc private func showHelp() {
-        let alert = NSAlert()
-        alert.messageText = "Disk Inventory Help"
-        alert.informativeText = """
-        Open a folder or volume. Each rectangle represents an item and its area shows its size. The file tree and treemap follow the same selection.
-
-        Double-click a folder to zoom. Use the path bar or Zoom Out to go back. The Kinds panel matches the colors on the map. Double-click a kind to list its files.
-
-        If a whole-disk scan reports skipped locations, you can add Disk Inventory to Full Disk Access in System Settings, then relaunch and rescan.
-        """
-        alert.addButton(withTitle: "Done")
-        alert.runModal()
+        if helpWindow == nil {
+            let window = NSWindow(contentViewController: NSHostingController(rootView: HelpView()))
+            window.title = "Disk Inventory Help"
+            window.styleMask = [.titled, .closable, .resizable]
+            window.isReleasedWhenClosed = false
+            window.setContentSize(NSSize(width: 480, height: 420))
+            window.center()
+            helpWindow = window
+        }
+        helpWindow?.makeKeyAndOrderFront(nil)
     }
 
     @objc(scanSelection:userData:error:)
@@ -358,15 +373,22 @@ struct VolumePicker: View {
         add(file, "Close Window", #selector(NSWindow.performClose(_:)), "w")
         file.addItem(.separator())
         add(file, "Open", #selector(ScanWindow.openSelected), "o", .option)
+        add(file, "Quick Look", #selector(ScanWindow.quickLook(_:)), "y")
         add(file, "Reveal in Finder", #selector(ScanWindow.revealInFinder), "r")
         add(file, "Get Info", #selector(ScanWindow.inspect), "i")
         add(file, "Move to Trash…", #selector(ScanWindow.moveToTrash), "\u{8}")
         add(file, "Clean Up…", #selector(ScanWindow.cleanUp), "k", .shift)
 
         let edit = submenu("Edit")
+        add(edit, "Undo", Selector(("undo:")), "z")
+        add(edit, "Redo", Selector(("redo:")), "z", .shift)
+        edit.addItem(.separator())
         add(edit, "Cut", #selector(NSText.cut(_:)), "x")
         add(edit, "Copy", #selector(NSText.copy(_:)), "c")
         add(edit, "Paste", #selector(NSText.paste(_:)), "v")
+        add(edit, "Delete", #selector(NSText.delete(_:)))
+        add(edit, "Select All", #selector(NSText.selectAll(_:)), "a")
+        edit.addItem(.separator())
         add(edit, "Copy File", #selector(ScanWindow.copySelection), "c", .shift)
         add(edit, "Copy Path", #selector(ScanWindow.copyPath), "c", [.shift, .option])
         edit.addItem(.separator())
@@ -380,8 +402,8 @@ struct VolumePicker: View {
         add(view, "Zoom Out", #selector(ScanWindow.zoomOut), "-")
         add(view, "Zoom to Root", #selector(ScanWindow.zoomRoot), "0")
         view.addItem(.separator())
-        add(view, "Refresh Selection", #selector(ScanWindow.refreshSelection), "r", .shift)
-        add(view, "Refresh All", #selector(ScanWindow.refreshAll), "r", .option)
+        add(view, "Rescan Selection", #selector(ScanWindow.refreshSelection), "r", .shift)
+        add(view, "Rescan", #selector(ScanWindow.refreshAll), "r", .option)
         view.addItem(.separator())
         for (title, key) in [
             ("Show Package Contents", "packages"), ("Show Allocated File Size", "physical"),
@@ -394,13 +416,13 @@ struct VolumePicker: View {
             view.addItem(item)
         }
         view.addItem(.separator())
-        add(view, "Toggle Inspector", #selector(ScanWindow.toggleDetails), "i", .option)
+        add(view, "Show Inspector", #selector(ScanWindow.toggleDetails), "i", .option)
+        add(view, "Show Largest Files", #selector(ScanWindow.toggleList), "l")
 
         let windows = submenu("Window")
         add(windows, "Minimize", #selector(NSWindow.performMiniaturize(_:)), "m")
         add(windows, "Zoom Window", #selector(NSWindow.performZoom(_:)))
         windows.addItem(.separator())
-        add(windows, "Selection List", #selector(ScanWindow.toggleList), "l")
         add(windows, "Bring All to Front", #selector(NSApplication.arrangeInFront(_:)))
         NSApp.windowsMenu = windows
 
@@ -495,11 +517,12 @@ struct VolumePicker: View {
 
     private func checkPreferencesPages() async -> Bool {
         guard let window = preferences, let view = window.contentView else { return false }
-        for page in [PreferencesView.Page.scanning, .behavior, .appearance] {
-            Settings.store.set(page.rawValue, forKey: "preferencesPage")
-            try? await Task.sleep(for: .milliseconds(100))
+        guard let tabs = window.contentViewController as? NSTabViewController else { return false }
+        for index in [1, 2, 0] {
+            tabs.selectedTabViewItemIndex = index
+            try? await Task.sleep(for: .milliseconds(150))
             view.layoutSubtreeIfNeeded()
-            guard view.bounds.height >= 540, view.bounds.width >= 600, window.isVisible else { return false }
+            guard window.isVisible, window.contentView?.bounds.height ?? 0 >= 300, window.contentView?.bounds.width ?? 0 >= 500 else { return false }
         }
         return true
     }
@@ -586,6 +609,29 @@ struct VolumePicker: View {
             print("Volume picker, volume scan reuse, preferences, scan, treemap, synchronized selection, zoom, search, refresh and close passed.")
             fflush(nil)
             exit(EXIT_SUCCESS)
+        }
+    }
+}
+
+
+private struct HelpView: View {
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                section("Treemap", "Each rectangle is a file or folder and its area is its size. Folders that are large enough show their name and size in a header. The file tree and the map share one selection. Double-click a folder to zoom in, use the path bar or Zoom Out (Cmd-Up) to go back, the arrow keys to move between tiles and Space to preview.")
+                section("Kinds and Largest Files", "Kinds lists space by file type in the colors of the map; choosing a kind highlights its tiles. Largest Files lists files by size and searches by name, kind or folder; matches stay highlighted on the map.")
+                section("Clean Up", "The Clean Up tab sorts what can go by how safe it is, shows advice Claude sent through the inventory MCP server with a reason for each item, and lists big files nobody opened for months that can move to iCloud Drive or Google Drive. Nothing is removed until you confirm, and removed items go to the Trash.")
+                section("Full Disk Access", "Without Full Disk Access macOS hides Mail, Messages, Safari and parts of Library, and may ask about Documents and Desktop during a scan. Turn on Disk Inventory in System Settings, Privacy & Security, Full Disk Access, then reopen the app and rescan.")
+            }
+            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func section(_ title: String, _ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.headline)
+            Text(text).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
 }

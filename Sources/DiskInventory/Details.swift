@@ -5,7 +5,7 @@ import InventoryCore
 @MainActor final class Details: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSMenuDelegate {
     let root = NSView()
     let tabs = NSSegmentedControl(labels: ["Kinds", "Largest Files", "Clean Up"], trackingMode: .selectOne, target: nil, action: nil)
-    let search = NSSearchField()
+    private(set) var search = NSSearchField()
     let fields = NSPopUpButton()
     let filter = NSPopUpButton()
     private let kindsTable = InventoryResultsView()
@@ -15,6 +15,7 @@ import InventoryCore
     var updateSearch: (() -> Void)?
     var tabChanged: (() -> Void)?
     var kindSelected: ((Int?) -> Void)?
+    var quickLook: (() -> Void)?
     var didSelect: ((Int) -> Void)?
     var didOpen: ((Int) -> Void)?
     var menuForRow: ((Int) -> NSMenu?)?
@@ -204,6 +205,18 @@ import InventoryCore
         changeTab()
     }
 
+    func adopt(searchField field: NSSearchField) {
+        guard field !== search else { return }
+        field.placeholderString = "Search files"
+        field.delegate = self
+        field.sendsSearchStringImmediately = true
+        field.sendsWholeSearchString = false
+        field.stringValue = search.stringValue
+        searchBar.removeArrangedSubview(search)
+        search.removeFromSuperview()
+        search = field
+    }
+
     func showCleanup(_ view: AnyView) {
         cleanupHost.rootView = view
     }
@@ -293,7 +306,9 @@ import InventoryCore
         updateSearch?()
     }
 
-    func controlTextDidChange(_ obj: Notification) { updateSearch?() }
+    func controlTextDidChange(_ obj: Notification) {
+        if searching { updateSearch?() } else { openSearch() }
+    }
     @objc private func doubleClick(_ sender: NSTableView) { _ = activate(sender, row: sender.clickedRow) }
 
     private func activate(_ table: NSTableView, row: Int) -> Bool {
@@ -330,13 +345,12 @@ import InventoryCore
         table.menu?.delegate = self
         table.setDraggingSourceOperationMask(.copy, forLocal: false)
         table.configureInventoryColumns(results ? "Results" : "Kinds", in: scroll)
-        table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
-        table.tableColumns.first?.resizingMask = [.autoresizingMask, .userResizingMask]
         table.setAccessibilityLabel(results ? "File search results" : "File kind statistics")
         table.activateRow = { [weak self, weak table] in
             guard let table else { return false }
             return self?.activate(table, row: table.selectedRow) ?? false
         }
+        if results { table.quickLook = { [weak self] in self?.quickLook?() } }
     }
 
     private func sortTotals() {
@@ -438,11 +452,15 @@ import InventoryCore
 
 @MainActor private final class InventoryResultsView: NSTableView {
     var activateRow: (() -> Bool)?
+    var quickLook: (() -> Void)?
 
     override func keyDown(with event: NSEvent) {
-        if (event.keyCode == 36 || event.keyCode == 76),
-           event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
-           activateRow?() == true { return }
+        let plain = event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty
+        if event.keyCode == 49, plain, let quickLook {
+            quickLook()
+            return
+        }
+        if (event.keyCode == 36 || event.keyCode == 76), plain, activateRow?() == true { return }
         super.keyDown(with: event)
     }
 }
@@ -510,8 +528,9 @@ import InventoryCore
     required init?(coder: NSCoder) { nil }
 
     func configure(title: String, color: NSColor) {
-        textField?.stringValue = title
-        textField?.toolTip = title
+        let shown = title.prefix(1).uppercased() + title.dropFirst()
+        textField?.stringValue = shown
+        textField?.toolTip = shown
         dot.layer?.backgroundColor = color.cgColor
         setAccessibilityLabel(title)
     }

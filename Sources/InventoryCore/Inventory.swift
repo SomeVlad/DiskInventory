@@ -58,6 +58,7 @@ public struct ScanProgress: Sendable {
     public let path: String
     public let traversal: ScanTraversal
     public var finishing = false
+    public var bytes: Int64 = 0
 }
 
 public enum ScanTraversal: String, Sendable {

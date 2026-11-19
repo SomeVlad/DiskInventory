@@ -76,6 +76,7 @@ enum BulkScan {
         private var active = 0
         private var failure: Error?
         private var entries = 0
+        private var bytes: Int64 = 0
         private var nextProgress = ContinuousClock.now
         private let backlog = Atomic<Int>(1)
         private let stopped = Atomic<Bool>(false)
@@ -149,20 +150,21 @@ enum BulkScan {
             if stopped.load(ordering: .relaxed) { throw CancellationError() }
         }
 
-        func counted(_ added: Int, path: @autoclosure () -> String) {
+        func counted(_ added: Int, bytes addedBytes: Int64, path: @autoclosure () -> String) {
             condition.lock()
             defer { condition.unlock() }
             entries += added
+            bytes += addedBytes
             guard ContinuousClock.now >= nextProgress else { return }
             nextProgress = .now + .milliseconds(125)
-            progress(ScanProgress(entries: entries, path: path(), traversal: .bulk))
+            progress(ScanProgress(entries: entries, path: path(), traversal: .bulk, bytes: bytes))
         }
 
         func outcome(finishing path: String) throws -> (units: [Unit], partials: [Partial]) {
             condition.lock()
             defer { condition.unlock() }
             if let failure { throw failure }
-            progress(ScanProgress(entries: entries, path: path, traversal: .bulk, finishing: true))
+            progress(ScanProgress(entries: entries, path: path, traversal: .bulk, finishing: true, bytes: bytes))
             let finished = partials.map { $0! }
             partials = []
             return (units, finished)
@@ -293,6 +295,7 @@ enum BulkScan {
             while true {
                 try coordinator.checkCancellation()
                 let before = nodes.count
+                var batchBytes: Int64 = 0
                 let count = getattrlistbulk(fd, &attributes, buffer.baseAddress, buffer.count, UInt64(FSOPT_RETURN_REALDEV))
                 if count == 0 { return }
                 if count < 0 {
@@ -382,9 +385,10 @@ enum BulkScan {
                         rawAllocated: metadata.allocated, isHardLink: metadata.hardLink, fileCount: metadata.directory ? 0 : 1
                     ))
                     nodes[parent].firstChild = Int32(id)
+                    batchBytes += metadata.allocated
                     if metadata.directory, entryFlags & UInt32(SF_DATALESS) != 0 { dataless.insert(id) }
                 }
-                coordinator.counted(nodes.count - before, path: path(for: parent))
+                coordinator.counted(nodes.count - before, bytes: batchBytes, path: path(for: parent))
             }
         }
 

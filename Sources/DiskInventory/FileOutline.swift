@@ -12,6 +12,7 @@ import UniformTypeIdentifiers
     var didSelect: ((Int?) -> Void)?
     var didOpen: ((Int) -> Void)?
     var menuForRow: ((Int) -> NSMenu?)?
+    var quickLook: (() -> Void)?
     private var snapshot: ScanSummary?
     private var options = ViewOptions()
     private var root = 0
@@ -28,7 +29,7 @@ import UniformTypeIdentifiers
     private var smallFont = false
     var isCompact: Bool { smallFont }
     private var icons: [String: NSImage] = [:]
-    private let pageSize = 600
+    private let pageSize = 2000
 
     private final class Row: NSObject {
         let id: Int
@@ -77,6 +78,7 @@ import UniformTypeIdentifiers
             guard let self else { return false }
             return activate(rowAt: view.selectedRow)
         }
+        view.quickLook = { [weak self] in self?.quickLook?() }
     }
 
     func setCompactText(_ compact: Bool) {
@@ -283,35 +285,24 @@ import UniformTypeIdentifiers
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         guard let row = item as? Row, let snapshot else { return nil }
         guard row.isPageControl || row.id < 0 || snapshot.nodes.indices.contains(row.id) else { return nil }
-        let font = NSFont.systemFont(ofSize: smallFont ? 11 : 13)
+        let size: CGFloat = smallFont ? 11 : 13
         if tableColumn?.identifier.rawValue == "size" {
-            let label = NSTextField(labelWithString: row.isPageControl ? "" : formatSize(snapshot.size(of: row.id, options: options)))
-            label.alignment = .right
-            label.font = .monospacedDigitSystemFont(ofSize: font.pointSize - 1, weight: .regular)
-            label.textColor = .secondaryLabelColor
-            label.lineBreakMode = .byTruncatingTail
-            return label
+            let cell = outlineView.makeView(withIdentifier: TextCell.identifier, owner: self) as? TextCell ?? TextCell()
+            cell.configure(text: row.isPageControl ? "" : formatSize(snapshot.size(of: row.id, options: options)),
+                           color: .secondaryLabelColor, numeric: true, size: size)
+            return cell
         }
         if row.isPageControl {
-            let title = row.pageDirection == 2 ? "Sorting…" : row.pageDirection < 0 ? "‹ Previous items" : "Next items ›"
-            let label = NSTextField(labelWithString: title)
-            label.textColor = .controlAccentColor
-            label.font = font
-            return label
+            let remaining = max(0, children(row.id).count - offset(row.id) - pageSize)
+            let title = row.pageDirection == 2 ? "Sorting…" : row.pageDirection < 0 ? "Show Previous Items" : "Show \(remaining.formatted()) More Items"
+            let cell = outlineView.makeView(withIdentifier: TextCell.identifier, owner: self) as? TextCell ?? TextCell()
+            cell.configure(text: title, color: .secondaryLabelColor, numeric: false, size: size)
+            return cell
         }
-        let label = NSTextField(labelWithString: title(row.id))
-        label.lineBreakMode = .byTruncatingMiddle
-        label.toolTip = label.stringValue
-        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        label.font = font
-        let icon = NSImageView(image: icon(for: row.id, snapshot: snapshot))
-        icon.imageScaling = .scaleProportionallyUpOrDown
-        icon.widthAnchor.constraint(equalToConstant: 16).isActive = true
-        icon.heightAnchor.constraint(equalToConstant: 16).isActive = true
-        let stack = NSStackView(views: [icon, label])
-        stack.spacing = 5
-        stack.alignment = .centerY
-        return stack
+        let cell = outlineView.makeView(withIdentifier: NameCell.identifier, owner: self) as? NameCell ?? NameCell()
+        let kind = row.id >= 0 ? snapshot.kinds[Int(snapshot.nodes[row.id].kind)].title : "Volume space"
+        cell.configure(name: title(row.id), icon: icon(for: row.id, snapshot: snapshot), kind: kind, size: size)
+        return cell
     }
 
     private func icon(for id: Int, snapshot: ScanSummary) -> NSImage {
@@ -383,11 +374,54 @@ extension FileOutline: NSMenuDelegate {
 
 @MainActor final class InventoryOutlineView: NSOutlineView {
     var activateRow: (() -> Bool)?
+    var quickLook: (() -> Void)?
 
     override func keyDown(with event: NSEvent) {
-        if (event.keyCode == 36 || event.keyCode == 76),
-           event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
-           activateRow?() == true { return }
+        let plain = event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty
+        if event.keyCode == 49, plain, let quickLook {
+            quickLook()
+            return
+        }
+        if (event.keyCode == 36 || event.keyCode == 76), plain, activateRow?() == true { return }
         super.keyDown(with: event)
+    }
+}
+
+@MainActor final class NameCell: NSTableCellView {
+    static let identifier = NSUserInterfaceItemIdentifier("NameCell")
+
+    init() {
+        super.init(frame: .zero)
+        identifier = Self.identifier
+        let image = NSImageView()
+        image.imageScaling = .scaleProportionallyUpOrDown
+        let field = NSTextField(labelWithString: "")
+        field.lineBreakMode = .byTruncatingMiddle
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        for view in [image, field] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(view)
+        }
+        imageView = image
+        textField = field
+        NSLayoutConstraint.activate([
+            image.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            image.centerYAnchor.constraint(equalTo: centerYAnchor),
+            image.widthAnchor.constraint(equalToConstant: 16),
+            image.heightAnchor.constraint(equalToConstant: 16),
+            field.leadingAnchor.constraint(equalTo: image.trailingAnchor, constant: 8),
+            field.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2),
+            field.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func configure(name: String, icon: NSImage, kind: String, size: CGFloat) {
+        textField?.stringValue = name
+        textField?.toolTip = name
+        textField?.font = .systemFont(ofSize: size)
+        imageView?.image = icon
+        imageView?.setAccessibilityLabel(kind)
     }
 }

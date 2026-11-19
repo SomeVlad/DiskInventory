@@ -48,6 +48,13 @@ import SwiftUI
     private let info = NSTextField(labelWithString: "")
     private let status = NSTextField(labelWithString: "")
     private let progress = NSProgressIndicator()
+    private let meter = NSProgressIndicator()
+    private var expectedBytes: Int64?
+    private var stallTimer: Timer?
+    private var lastProgress = (entries: 0, at: ContinuousClock.now, path: "")
+    private var accessPromptShown = false
+    private var pathIDs: [Int] = []
+    private var infoPanel: InfoPanelController?
     private let cancel = NSButton(title: "Cancel", target: nil, action: nil)
     private let issues = NSButton(title: "Scan Issues", target: nil, action: nil)
     private var rescanningSelection: URL?
@@ -86,7 +93,7 @@ import SwiftUI
             return fail("selection sync")
         }
         zoomTo(id: folder)
-        guard zoom == folder, pathControl.url == snapshot.url(for: folder) else { return fail("zoom in") }
+        guard zoom == folder, pathIDs.last == folder else { return fail("zoom in") }
         zoomOut()
         guard zoom == 0 else { return fail("zoom out") }
         details.showList(query: snapshot.nodes[file].name)
@@ -248,8 +255,9 @@ import SwiftUI
             backing: .buffered, defer: false
         )
         super.init(window: window)
-        window.title = location.lastPathComponent.isEmpty ? "Disk Inventory" : location.lastPathComponent
+        window.title = location.lastPathComponent.isEmpty ? "Disk Inventory" : displayName
         window.subtitle = "Disk Inventory"
+        window.representedURL = location.path == "/System/Volumes/Data" ? URL(filePath: "/") : location
         window.minSize = NSSize(width: 815, height: 565)
         window.isReleasedWhenClosed = false
         window.delegate = self
@@ -309,9 +317,9 @@ import SwiftUI
         panes.addSplitViewItem(detailPane)
 
         pathControl.pathStyle = .standard
-        pathControl.url = location
         pathControl.target = self
         pathControl.action = #selector(breadcrumb)
+        updatePath()
         pathControl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         info.textColor = .secondaryLabelColor
         info.font = .systemFont(ofSize: 12)
@@ -326,6 +334,13 @@ import SwiftUI
         progress.isDisplayedWhenStopped = false
         progress.widthAnchor.constraint(equalToConstant: 16).isActive = true
         progress.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        meter.style = .bar
+        meter.isIndeterminate = false
+        meter.controlSize = .small
+        meter.minValue = 0
+        meter.maxValue = 1
+        meter.isHidden = true
+        meter.widthAnchor.constraint(equalToConstant: 120).isActive = true
         cancel.bezelStyle = .rounded
         cancel.controlSize = .small
         cancel.target = self
@@ -340,11 +355,11 @@ import SwiftUI
         issues.isHidden = true
 
         let header = NSStackView(views: [pathControl])
-        header.edgeInsets = NSEdgeInsets(top: 5, left: 14, bottom: 5, right: 14)
+        header.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
         let space = NSView()
         space.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let footer = NSStackView(views: [progress, info, space, status, issues, cancel])
-        footer.edgeInsets = NSEdgeInsets(top: 6, left: 14, bottom: 6, right: 14)
+        let footer = NSStackView(views: [progress, info, space, status, meter, issues, cancel])
+        footer.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
         footer.spacing = 8
         footer.alignment = .centerY
         let top = NSBox()
@@ -409,6 +424,8 @@ import SwiftUI
         files.didSelect = { [weak self] id in self?.select(id, reveal: false) }
         files.didOpen = { [weak self] id in self?.openItem(id) }
         files.menuForRow = { [weak self] id in self?.contextMenu(id) }
+        files.quickLook = { [weak self] in self?.toggleQuickLook() }
+        details.quickLook = { [weak self] in self?.toggleQuickLook() }
         details.didSelect = { [weak self] id in self?.select(id, fromSearch: true) }
         details.didOpen = { [weak self] id in self?.openItem(id) }
         details.menuForRow = { [weak self] id in self?.contextMenu(id) }
@@ -449,8 +466,9 @@ import SwiftUI
 
     private func updateMapEmphasis() {
         if details.cleaning, let cleanupModel {
+            let candidates = cleanupModel.candidateIDs
             map.highlightKind = nil
-            map.highlightNodes = cleanupModel.candidateIDs
+            map.highlightNodes = candidates.isEmpty ? nil : candidates
         } else if details.searching, details.hasMatches, !details.query.isEmpty || details.kind != nil {
             map.highlightKind = nil
             map.highlightNodes = Set(details.matchIDs)
@@ -474,8 +492,67 @@ import SwiftUI
         if panel.isVisible { panel.reloadData() } else { panel.makeKeyAndOrderFront(nil) }
     }
 
+    private var isVolumeScan: Bool {
+        location.path == "/System/Volumes/Data" || (try? location.resourceValues(forKeys: [.isVolumeKey]).isVolume) == true
+    }
+
+    private static var hasFullDiskAccess: Bool {
+        let descriptor = Darwin.open("/Library/Application Support/com.apple.TCC/TCC.db", O_RDONLY)
+        guard descriptor >= 0 else { return false }
+        Darwin.close(descriptor)
+        return true
+    }
+
+    private static func openPrivacySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func askForAccess(then proceed: @escaping () -> Void) -> Bool {
+        guard !accessPromptShown, isVolumeScan, !Self.hasFullDiskAccess, !Settings.bool("skipAccessPrompt"), let window else { return false }
+        accessPromptShown = true
+        let alert = NSAlert()
+        alert.messageText = "Allow Full Disk Access for a complete scan"
+        alert.informativeText = "Without it macOS hides Mail, Messages, Safari and parts of Library from Disk Inventory, and may ask about Documents and Desktop in the middle of the scan. Turn on Disk Inventory in Privacy & Security → Full Disk Access, then reopen the app."
+        alert.addButton(withTitle: "Open Privacy Settings")
+        alert.addButton(withTitle: "Scan Anyway")
+        alert.showsSuppressionButton = true
+        alert.suppressionButton?.title = "Don’t ask again"
+        alert.beginSheetModal(for: window) { response in
+            if alert.suppressionButton?.state == .on { Settings.store.set(true, forKey: "skipAccessPrompt") }
+            if response == .alertFirstButtonReturn { Self.openPrivacySettings() }
+            proceed()
+        }
+        return true
+    }
+
+    private func stopScanIndicators() {
+        progress.stopAnimation(nil)
+        cancel.isHidden = true
+        meter.isHidden = true
+        stallTimer?.invalidate()
+        stallTimer = nil
+    }
+
+    private func checkStall() {
+        guard scanWorker != nil, started(ago: 8) else { return }
+        let parts = lastProgress.path.split(separator: "/")
+        let folder = parts.count > 2 && lastProgress.path.hasPrefix(NSHomeDirectory()) ? String(parts[2]) : String(parts.last ?? "")
+        status.stringValue = "Waiting for access to “\(folder)”"
+        map.placeholder = MapPlaceholder(
+            title: "Waiting for macOS", symbol: "hourglass",
+            detail: "Reading “\(folder)” has not answered for a while. macOS may be asking for permission to access it; answer the prompt or cancel the scan.",
+            busy: true)
+    }
+
+    private func started(ago seconds: Int) -> Bool {
+        lastProgress.at.duration(to: .now) > .seconds(seconds)
+    }
+
     func scan(restore: Bool = true, refreshing id: Int? = nil, afterTrash: Bool = false) {
         guard !closed, !isTrashing else { return }
+        if id == nil, !afterTrash, askForAccess(then: { [weak self] in self?.scan(restore: restore) }) { return }
         let oldSnapshot = snapshot
         let selectedURL = rescanningSelection ?? selected.flatMap { $0 >= 0 ? oldSnapshot?.url(for: $0) : nil }
         let zoomURL = oldSnapshot?.url(for: zoom)
@@ -493,6 +570,12 @@ import SwiftUI
         cancel.isHidden = afterTrash
         issues.isHidden = true
         status.stringValue = afterTrash ? "Updating after move…" : "Scanning…"
+        expectedBytes = id == nil && isVolumeScan ? VolumeUsage.read(location).map { max(1, $0.capacity - $0.free) } : nil
+        lastProgress = (0, .now, location.path)
+        stallTimer?.invalidate()
+        stallTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkStall() }
+        }
         info.stringValue = location.path
         map.placeholder = MapPlaceholder(title: "Scanning \(displayName)", symbol: "magnifyingglass", busy: true)
         let (updates, continuation) = AsyncStream.makeStream(of: ScanProgress.self, bufferingPolicy: .bufferingNewest(1))
@@ -527,13 +610,22 @@ import SwiftUI
                     title: update.finishing ? "Calculating Totals" : "Scanning \(self.displayName)", symbol: "magnifyingglass",
                     detail: "\(update.entries.formatted()) items · \(elapsed)", busy: true)
                 let traversal = update.traversal == .bulk ? "APFS" : "Compatible"
-                self.status.stringValue = "\(update.entries.formatted()) entries · \(elapsed)"
+                if update.entries != self.lastProgress.entries {
+                    self.lastProgress = (update.entries, .now, update.path)
+                }
+                if let expected = self.expectedBytes, !update.finishing {
+                    let fraction = min(0.99, Double(update.bytes) / Double(expected))
+                    self.meter.isHidden = false
+                    self.meter.doubleValue = fraction
+                    self.status.stringValue = "\(fraction.formatted(.percent.precision(.fractionLength(0)))) · \(update.entries.formatted()) items · \(elapsed)"
+                } else {
+                    self.status.stringValue = "\(update.entries.formatted()) items · \(elapsed)"
+                }
                 self.info.stringValue = "\(traversal) · \(update.path)"
             }
             guard let self, !Task.isCancelled, self.generation == token else { return }
             self.scanWorker = nil
-            self.progress.stopAnimation(nil)
-            self.cancel.isHidden = true
+            self.stopScanIndicators()
             defer { self.applyDeferredSettings() }
             do {
                 let result = try await worker.value
@@ -603,8 +695,17 @@ import SwiftUI
     @objc func cancelScan() {
         guard !cancel.isHidden, let scanWorker else { return }
         scanWorker.cancel()
-        cancel.isEnabled = false
-        status.stringValue = "Cancelling…"
+        whileScanning?.cancel()
+        generation = UUID()
+        self.scanWorker = nil
+        stopScanIndicators()
+        if snapshot != nil {
+            renderAll(reusePalette: true)
+        } else {
+            updateStatus()
+            status.stringValue = "Canceled"
+            showPlaceholder(MapPlaceholder(title: "Scan Canceled", symbol: "xmark.circle", action: "Scan Again")) { [weak self] in self?.scan() }
+        }
     }
 
     private func applyDeferredSettings() {
@@ -665,7 +766,7 @@ import SwiftUI
         mapUpdate = nil
         totals = nil
         if !reusePalette { colors = [] }
-        pathControl.url = snapshot?.url(for: zoom) ?? location
+        updatePath()
         files.display(snapshot, root: zoom, options: options)
         files.reveal(selected)
         searchWorker?.cancel()
@@ -751,7 +852,7 @@ import SwiftUI
         }
         let node = snapshot.nodes[zoom]
         if !isTrashing, scanWorker == nil {
-            status.stringValue = "\(node.fileCount.formatted()) files   ·   \(formatSize(node.size(options.mode)))"
+            status.stringValue = "\(node.fileCount.formatted()) files · \(formatSize(node.size(options.mode)))"
         }
         issues.isHidden = snapshot.issueCount == 0
         issues.title = "\(snapshot.issueCount.formatted()) skipped"
@@ -765,9 +866,9 @@ import SwiftUI
             return
         }
         if id < 0 {
-            info.stringValue = "\(id == -1 ? "Free Space" : "Other Space")  ·  \(formatSize(snapshot.size(of: id, options: options)))"
+            info.stringValue = "\(id == -1 ? "Free Space" : "Other Space") · \(formatSize(snapshot.size(of: id, options: options)))"
         } else {
-            info.stringValue = "\(formatSize(snapshot.size(of: id, options: options)))  ·  \(snapshot.url(for: id).path)"
+            info.stringValue = "\(formatSize(snapshot.size(of: id, options: options))) · \(snapshot.displayPath(of: id))"
         }
         info.toolTip = info.stringValue
     }
@@ -786,6 +887,7 @@ import SwiftUI
         if previewOverride == nil, QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
             QLPreviewPanel.shared().reloadData()
         }
+        updateInfoPanel()
         if let id, id >= 0, Settings.bool("syncFinder") { revealInFinder() }
     }
 
@@ -795,7 +897,7 @@ import SwiftUI
         if zoom != id { map.acceptsTileActions = false }
         zoom = id
         selected = selectAfter ?? id
-        pathControl.url = snapshot.url(for: id)
+        updatePath()
         files.display(snapshot, root: id, options: options)
         files.reveal(selected)
         map.selection = selected
@@ -804,9 +906,24 @@ import SwiftUI
         updateStatus()
     }
 
+    private func updatePath() {
+        let ids = snapshot?.lineage(of: zoom) ?? [0]
+        pathIDs = ids
+        pathControl.pathItems = ids.map { id in
+            let item = NSPathControlItem()
+            let url = snapshot?.url(for: id) ?? location
+            item.title = id == 0 ? displayName : snapshot?.nodes[id].name ?? url.lastPathComponent
+            let icon = NSWorkspace.shared.icon(forFile: id == 0 && location.path == "/System/Volumes/Data" ? "/" : url.path)
+            icon.size = NSSize(width: 16, height: 16)
+            item.image = icon
+            return item
+        }
+    }
+
     @objc private func breadcrumb() {
-        guard let clicked = pathControl.clickedPathItem?.url, let id = snapshot?.find(clicked) else { return }
-        zoomTo(id: id)
+        guard let clicked = pathControl.clickedPathItem,
+              let index = pathControl.pathItems.firstIndex(of: clicked), pathIDs.indices.contains(index) else { return }
+        zoomTo(id: pathIDs[index])
     }
 
     @objc func zoomIn() {
@@ -895,45 +1012,54 @@ import SwiftUI
     }
 
     @objc func inspect() {
-        guard let snapshot, let selected, selected >= 0, let window else { return }
-        let item = snapshot.nodes[selected]
-        let url = snapshot.url(for: selected)
-        let attrs = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
-        let alert = NSAlert()
-        alert.messageText = item.name
-        let created = attrs?.creationDate?.formatted(date: .abbreviated, time: .shortened) ?? "—"
-        let modified = attrs?.contentModificationDate?.formatted(date: .abbreviated, time: .shortened) ?? "—"
-        alert.informativeText = """
-        \(url.path)
+        if infoPanel == nil { infoPanel = InfoPanelController() }
+        infoPanel?.showWindow(nil)
+        updateInfoPanel()
+    }
 
-        Kind: \(snapshot.kinds[Int(item.kind)].title)
-        Allocated: \(formatSize(item.allocated)) (\(item.allocated.formatted()) bytes)
-        Logical: \(formatSize(item.logical)) (\(item.logical.formatted()) bytes)
-        Files: \(item.fileCount.formatted())
-        Created: \(created)
-        Modified: \(modified)
-        """
-        alert.icon = NSWorkspace.shared.icon(forFile: url.path)
-        alert.addButton(withTitle: "Done")
-        alert.beginSheetModal(for: window)
+    private func updateInfoPanel() {
+        guard let infoPanel, infoPanel.window?.isVisible == true else { return }
+        guard let snapshot, let selected, selected >= 0 else {
+            infoPanel.show(nil)
+            return
+        }
+        let item = snapshot.nodes[selected]
+        let url = URL(filePath: snapshot.displayPath(of: selected))
+        let values = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
+        infoPanel.show(ItemInfo(
+            name: item.name, path: url.path, kind: snapshot.kinds[Int(item.kind)].title,
+            allocated: item.allocated, logical: item.logical, files: item.isDirectory ? item.fileCount : nil,
+            created: values?.creationDate, modified: values?.contentModificationDate,
+            icon: NSWorkspace.shared.icon(forFile: url.path)))
     }
 
     @objc func showIssues() {
         guard let snapshot, let window else { return }
         let alert = NSAlert()
-        alert.messageText = "\(snapshot.issueCount.formatted()) entries couldn’t be scanned"
-        alert.informativeText = "The treemap and totals reflect the items macOS allowed this app to read."
+        alert.messageText = "\(snapshot.issueCount.formatted()) locations couldn’t be read"
+        let reasons = Dictionary(grouping: snapshot.issues, by: \.message)
+            .map { (reason: $0.key, count: $0.value.count) }
+            .sorted { $0.count > $1.count }
+        let permission = reasons.contains { $0.reason.contains("not permitted") || $0.reason.contains("Permission denied") }
+        var text = reasons.map { "\($0.reason): \($0.count.formatted())" }.joined(separator: "\n")
+        if snapshot.issueCount > snapshot.issues.count { text += "\n(the first \(snapshot.issues.count) are listed)" }
+        text += "\n\nThe treemap and totals include only what macOS allowed Disk Inventory to read."
+        if permission { text += " Most of these need Full Disk Access." }
+        alert.informativeText = text
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 565, height: 180))
         scroll.hasVerticalScroller = true
         scroll.borderType = .bezelBorder
-        let text = NSTextView(frame: scroll.bounds)
-        text.isEditable = false
-        text.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        text.string = snapshot.issues.map { "\($0.path)\n\($0.message)" }.joined(separator: "\n\n")
-        scroll.documentView = text
+        let list = NSTextView(frame: scroll.bounds)
+        list.isEditable = false
+        list.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        list.string = snapshot.issues.map { "\($0.path) — \($0.message)" }.joined(separator: "\n")
+        scroll.documentView = list
         alert.accessoryView = scroll
+        if permission { alert.addButton(withTitle: "Open Privacy Settings") }
         alert.addButton(withTitle: "Done")
-        alert.beginSheetModal(for: window)
+        alert.beginSheetModal(for: window) { response in
+            if permission, response == .alertFirstButtonReturn { Self.openPrivacySettings() }
+        }
     }
 
     @objc func moveToTrash() {
@@ -1054,15 +1180,22 @@ import SwiftUI
         guard id >= 0 else { return nil }
         select(id)
         let menu = NSMenu()
-        let actions: [(String, Selector)] = [
-            ("Open", #selector(openSelected)), ("Reveal in Finder", #selector(revealInFinder)),
-            ("Get Info", #selector(inspect)), ("Copy Path", #selector(copyPath)), ("Refresh", #selector(refreshSelection)),
-            ("Zoom In", #selector(zoomIn)), ("Zoom Out", #selector(zoomOut)), ("Move to Trash…", #selector(moveToTrash))
+        let groups: [[(String, String, Selector)]] = [
+            [("Open", "arrow.up.forward.app", #selector(openSelected)), ("Quick Look", "eye", #selector(quickLook(_:))),
+             ("Reveal in Finder", "folder", #selector(revealInFinder))],
+            [("Get Info", "info.circle", #selector(inspect)), ("Copy Path", "doc.on.doc", #selector(copyPath))],
+            [("Zoom In", "plus.magnifyingglass", #selector(zoomIn)), ("Zoom Out", "minus.magnifyingglass", #selector(zoomOut)),
+             ("Rescan Selection", "arrow.clockwise", #selector(refreshSelection))],
+            [("Move to Trash…", "trash", #selector(moveToTrash))]
         ]
-        for (title, action) in actions {
-            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
-            item.target = self
-            menu.addItem(item)
+        for (index, group) in groups.enumerated() {
+            if index > 0 { menu.addItem(.separator()) }
+            for (title, symbol, action) in group {
+                let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+                item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+                item.target = self
+                menu.addItem(item)
+            }
         }
         return menu
     }
@@ -1077,7 +1210,12 @@ import SwiftUI
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        menuItem.action.map(canPerformAction) ?? false
+        if menuItem.action == #selector(toggleDetails) {
+            menuItem.title = detailPane.isCollapsed ? "Show Inspector" : "Hide Inspector"
+        } else if menuItem.action == #selector(toggleList) {
+            menuItem.title = details.searching ? "Show Kinds" : "Show Largest Files"
+        }
+        return menuItem.action.map(canPerformAction) ?? false
     }
 
     func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
@@ -1091,6 +1229,7 @@ import SwiftUI
              #selector(inspect), #selector(copyPath), #selector(copySelection), #selector(copy(_:)), #selector(findSelection):
             return selectedURL != nil
         case #selector(refreshSelection): return selectedURL != nil && scanWorker == nil && !isTrashing
+        case #selector(quickLook(_:)): return selectedURL != nil
         case #selector(refreshAll): return scanWorker == nil && !isTrashing
         case #selector(moveToTrash): return (selected ?? 0) > 0 && scanWorker == nil && !isTrashing
         case #selector(cleanUp): return snapshot != nil
@@ -1122,7 +1261,7 @@ import SwiftUI
         ("reveal", "Reveal in Finder", "folder", #selector(revealInFinder)),
         ("info", "Get Info", "info.circle", #selector(inspect)),
         ("search", "Find", "magnifyingglass", #selector(findFiles)),
-        ("details", "Toggle Inspector", "sidebar.right", #selector(toggleDetails)),
+        ("details", "Inspector", "sidebar.right", #selector(toggleDetails)),
         ("trash", "Move to Trash", "trash", #selector(moveToTrash)),
         ("cleanup", "Clean Up", "checklist", #selector(cleanUp))
     ]
@@ -1136,6 +1275,13 @@ import SwiftUI
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        if id.rawValue == "search" {
+            let item = NSSearchToolbarItem(itemIdentifier: id)
+            item.label = "Search"
+            item.preferredWidthForSearchField = 200
+            details.adopt(searchField: item.searchField)
+            return item
+        }
         guard let definition = Self.toolbarItems.first(where: { $0.0 == id.rawValue }) else { return nil }
         let item = NSToolbarItem(itemIdentifier: id)
         item.label = definition.1
