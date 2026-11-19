@@ -95,3 +95,39 @@ private func temporaryHome() throws -> URL {
     let second = try CloudOffload.move(file, to: googleDrive, home: home)
     #expect(second.lastPathComponent == "clip 2.mov")
 }
+
+@Test func adviceGuardKeepsSystemAreasOut() throws {
+    let scratch = URL(filePath: "/private/tmp/advice-guard-" + UUID().uuidString)
+    try makeFile(scratch.appending(path: "blob"))
+    defer { try? FileManager.default.removeItem(at: scratch) }
+
+    #expect(AdviceGuard.normalize("/tmp/x") == "/private/tmp/x")
+    #expect(AdviceGuard.normalize("/System/Volumes/Data/Library/Caches") == "/Library/Caches")
+    #expect(AdviceGuard.refusal(for: scratch.path, verdict: .safe) == nil)
+    #expect(AdviceGuard.refusal(for: "/Library/Caches", verdict: .safe) != nil)
+    #expect(AdviceGuard.refusal(for: "/usr/bin/true", verdict: .review) != nil)
+    #expect(AdviceGuard.refusal(for: "/System/Library", verdict: .review) != nil)
+    #expect(AdviceGuard.refusal(for: "/Library/Preferences", verdict: .review) != nil)
+    #expect(AdviceGuard.refusal(for: "/Applications", verdict: .review) != nil)
+    if let app = try FileManager.default.contentsOfDirectory(atPath: "/Applications").first(where: { $0.hasSuffix(".app") }) {
+        #expect(AdviceGuard.refusal(for: "/Applications/" + app, verdict: .review) == nil)
+        #expect(AdviceGuard.refusal(for: "/Applications/" + app, verdict: .safe) != nil)
+    }
+    #expect(AdviceGuard.refusal(for: "/usr/bin/true", verdict: .keep) == nil)
+}
+
+@Test func adviceActionsOnlyRunFromTheAllowlist() {
+    #expect(AdviceActions.refusal("rm-rf", argument: "/") != nil)
+    #expect(AdviceActions.refusal("simctl-delete-device", argument: nil) != nil)
+    #expect(AdviceActions.refusal("simctl-delete-device", argument: "not-a-simulator") != nil)
+    #expect(AdviceActions.refusal("brew-uninstall-cask", argument: "x; rm -rf ~") != nil)
+    #expect(AdviceActions.refusal("empty-trash", argument: nil) == nil)
+    #expect(AdviceActions.definition("simctl-delete-device")?.commandLine("ABC") == "/usr/bin/xcrun simctl delete ABC")
+    #expect(AdviceActions.parseSize("34.6MB") == 34_600_000)
+    #expect(AdviceActions.parseSize("1.2GB (40%)") == 1_200_000_000)
+
+    var item = AdviceItem(path: "", size: 0, verdict: .regenerable, reason: "", action: "empty-trash")
+    #expect(item.isRunnable && !item.isRemovable)
+    item.status = .done
+    #expect(!item.isRunnable)
+}

@@ -40,6 +40,8 @@
 	<string>7</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Disk Inventory asks Finder to move items owned by the system to the Trash and to empty the Trash.</string>
 	<key>NSDesktopFolderUsageDescription</key>
 	<string>Disk Inventory reads file sizes and metadata in folders you choose to scan.</string>
 	<key>NSDocumentsFolderUsageDescription</key>

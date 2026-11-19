@@ -47,6 +47,9 @@ public enum CleanupCategories {
     public static let simulatorCaches = CleanupCategory(
         id: "simulator-caches", title: "Simulator Caches",
         explanation: "Xcode rebuilds them the next time a simulator starts.", safety: .safe)
+    public static let systemCaches = CleanupCategory(
+        id: "system-caches", title: "System Caches and Logs",
+        explanation: "Shared caches and logs in /Library, rebuilt by the apps that wrote them; Finder asks for an administrator password for items the system owns.", safety: .regenerable)
     public static let derivedData = CleanupCategory(
         id: "derived-data", title: "Xcode DerivedData",
         explanation: "Intermediate build files; Xcode builds the project again, which takes time.", safety: .regenerable)
@@ -112,6 +115,9 @@ public enum CleanupAnalyzer {
         PathRule(path: ".pub-cache", pick: .itself, category: CleanupCategories.toolCaches),
         PathRule(path: ".bun/install/cache", pick: .itself, category: CleanupCategories.toolCaches),
         PathRule(path: "Library/pnpm/store", pick: .itself, category: CleanupCategories.toolCaches),
+        PathRule(path: "/Library/Caches", pick: .children, category: CleanupCategories.systemCaches),
+        PathRule(path: "/Library/Logs", pick: .children, category: CleanupCategories.systemCaches),
+        PathRule(path: "/Library/Developer/CoreSimulator/Caches", pick: .itself, category: CleanupCategories.systemCaches),
         PathRule(path: ".ollama/models", pick: .itself, category: CleanupCategories.models),
         PathRule(path: ".lmstudio/models", pick: .itself, category: CleanupCategories.models),
     ]
@@ -147,13 +153,16 @@ public enum CleanupAnalyzer {
 
         let homePath = home.standardizedFileURL.path
         for rule in pathRules {
-            guard let id = snapshot.locate(homePath + "/" + rule.path), snapshot.nodes[id].isDirectory else { continue }
+            let path = rule.path.hasPrefix("/") ? rule.path : homePath + "/" + rule.path
+            guard let id = snapshot.locate(path), snapshot.nodes[id].isDirectory else { continue }
             switch rule.pick {
             case .itself:
                 claim(id, rule.category)
             case .children:
-                for child in snapshot.children(of: id) where !snapshot.nodes[child].name.hasPrefix(".") {
-                    let category = rule.path == ".cache" && modelCaches.contains(snapshot.nodes[child].name)
+                for child in snapshot.children(of: id) {
+                    let name = snapshot.nodes[child].name
+                    guard !name.hasPrefix("."), !(rule.path.hasPrefix("/") && name.hasPrefix("com.apple.")) else { continue }
+                    let category = rule.path == ".cache" && modelCaches.contains(name)
                         ? CleanupCategories.models : rule.category
                     claim(child, category)
                 }

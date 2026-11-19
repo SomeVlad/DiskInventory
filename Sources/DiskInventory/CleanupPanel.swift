@@ -40,7 +40,7 @@ import SwiftUI
         snapshot.locate(home) != nil || snapshot.displayPath(of: 0).hasPrefix(home + "/")
     }
 
-    var pendingAdvice: [AdviceItem] { advice?.items.filter { $0.status == .pending && $0.verdict != .keep } ?? [] }
+    var pendingAdvice: [AdviceItem] { advice?.items.filter(\.isRemovable) ?? [] }
     var removable: [CleanupItem] { groups.filter { $0.category != CleanupCategories.trash }.flatMap(\.items) }
     var chosenAdvice: [AdviceItem] { pendingAdvice.filter { adviceSelected.contains($0.id) } }
     var chosenRules: [CleanupItem] {
@@ -122,22 +122,20 @@ import SwiftUI
         let rules = chosenRules.map { URL(filePath: path(of: $0.node)) }
         let urls = advised.map { URL(filePath: $0.path) } + rules
         working = "Moving \(urls.count) items to the Trash…"
-        let outcome = await Task.detached(priority: .userInitiated) { () -> ([URL], [String]) in
-            var done: [URL] = []
-            var errors: [String] = []
-            for url in urls {
-                do {
-                    try FileManager.default.trashItem(at: url, resultingItemURL: nil)
-                    done.append(url)
-                } catch {
-                    errors.append("\(url.path): \(error.localizedDescription)")
-                }
-            }
-            return (done, errors)
-        }.value
+        let outcome = await Task.detached(priority: .userInitiated) { AdviceTrash.move(urls) }.value
         let trashed = Set(outcome.0.map(\.path))
         try? AdviceStore.mark(Set(advised.filter { trashed.contains($0.path) }.map(\.id)), as: .trashed)
         await finish(removed: outcome.0, refreshed: [], errors: outcome.1)
+    }
+
+    func run(_ item: AdviceItem) async {
+        guard let action = item.action else { return }
+        working = "Running \(item.title)…"
+        let argument = item.argument
+        let result = await Task.detached(priority: .userInitiated) { AdviceActions.perform(action, argument: argument) }.value
+        try? AdviceStore.mark([item.id], as: result.ok ? .done : .failed, output: result.output)
+        let affected = action == "empty-trash" ? home + "/.Trash" : item.path
+        await finish(removed: [], refreshed: affected.isEmpty ? [] : [URL(filePath: affected)], errors: [])
     }
 
     func moveChosen() async {
@@ -207,6 +205,7 @@ struct CleanupPanel: View {
     @State private var focus: String?
     @State private var confirmTrash = false
     @State private var confirmMove = false
+    @State private var confirmRun: AdviceItem?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -263,6 +262,14 @@ struct CleanupPanel: View {
         } message: {
             Text("They go to “\(CloudOffload.archiveFolder)” and keep their folder structure. The space comes back after they finish uploading and you remove the local copies.")
         }
+        .confirmationDialog(confirmRun?.title ?? "", isPresented: Binding { confirmRun != nil } set: { if !$0 { confirmRun = nil } },
+                            presenting: confirmRun) { item in
+            Button(item.action == "empty-trash" ? "Empty Trash" : "Run", role: .destructive) { Task { await model.run(item) } }
+        } message: { item in
+            let definition = item.action.flatMap(AdviceActions.definition)
+            Text([definition?.explanation, definition?.commandLine(item.argument), item.size > 0 ? "Frees about \(formatSize(item.size))." : nil]
+                .compactMap { $0 }.joined(separator: "\n\n"))
+        }
         .sheet(isPresented: $model.showingFailures) { failureSheet }
     }
 
@@ -277,7 +284,7 @@ struct CleanupPanel: View {
                         .padding(.vertical, 2)
                 }
                 ForEach(advice.items) { item in
-                    AdviceRow(model: model, item: item).tag(item.path)
+                    AdviceRow(model: model, item: item) { confirmRun = $0 }.tag(item.path.isEmpty ? nil : item.path)
                 }
             } header: {
                 VStack(alignment: .leading, spacing: 2) {
@@ -420,10 +427,20 @@ private struct ItemMenu: View {
 private struct AdviceRow: View {
     @Bindable var model: CleanupModel
     let item: AdviceItem
+    let run: (AdviceItem) -> Void
+
+    private var location: String {
+        if item.path.isEmpty { return item.action.flatMap { AdviceActions.definition($0)?.commandLine(item.argument) } ?? "" }
+        return model.display(item.isAction ? item.path : URL(filePath: item.path).deletingLastPathComponent().path)
+    }
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            if item.status == .pending && item.verdict != .keep {
+            if item.isAction {
+                Image(systemName: item.status == .done ? "checkmark" : item.status == .failed ? "exclamationmark.triangle" : "terminal")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 14)
+            } else if item.status == .pending && item.verdict != .keep {
                 Toggle(model.display(item.path), isOn: Binding {
                     model.adviceSelected.contains(item.id)
                 } set: { on in
@@ -437,11 +454,11 @@ private struct AdviceRow: View {
                     .frame(width: 14)
             }
             VStack(alignment: .leading, spacing: 3) {
-                Text(URL(filePath: item.path).lastPathComponent)
-                    .strikethrough(item.status == .trashed || item.status == .missing)
+                Text(item.title)
+                    .strikethrough(item.status == .trashed || item.status == .missing || item.status == .done)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text(model.display(URL(filePath: item.path).deletingLastPathComponent().path))
+                Text(location)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -460,7 +477,20 @@ private struct AdviceRow: View {
                 case .trashed: Text("Moved to the Trash").font(.caption).foregroundStyle(.tertiary)
                 case .kept: Text("You kept this").font(.caption).foregroundStyle(.tertiary)
                 case .missing: Text("No longer on disk").font(.caption).foregroundStyle(.tertiary)
-                case .pending: EmptyView()
+                case .done: Text("Done").font(.caption).foregroundStyle(.tertiary)
+                case .failed:
+                    Text(item.output.map { String($0.suffix(600)) } ?? "Failed")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(8)
+                        .textSelection(.enabled)
+                case .pending:
+                    if item.isRunnable {
+                        Button(item.action == "empty-trash" ? "Empty Trash…" : "Run…") { run(item) }
+                            .controlSize(.small)
+                            .disabled(model.working != nil)
+                            .padding(.top, 2)
+                    }
                 }
             }
             Spacer(minLength: 4)
@@ -468,7 +498,7 @@ private struct AdviceRow: View {
         }
         .padding(.vertical, 3)
         .contextMenu {
-            ItemMenu(model: model, path: item.path)
+            if !item.path.isEmpty { ItemMenu(model: model, path: item.path) }
             if item.status == .pending, item.verdict != .keep {
                 Divider()
                 Button("Keep") { model.keep(item) }
