@@ -142,7 +142,8 @@ public enum CleanupAnalyzer {
     private static let installerSuffixes: Set<String> = ["dmg", "pkg", "mpkg", "xip", "iso"]
 
     public static func analyze(_ snapshot: ScanSummary, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> [CleanupGroup] {
-        let size: (Int) -> Int64 = { snapshot.nodes[$0].allocated }
+        let held = snapshot.heldByClones()
+        let size: (Int) -> Int64 = { snapshot.reclaimable($0, held: held) }
         var claimed = Set<Int>()
         var items: [CleanupItem] = []
 
@@ -411,6 +412,46 @@ public extension ScanSummary {
         let data = "/System/Volumes/Data"
         guard root.path == data || root.path.hasPrefix(data + "/"), !path.hasPrefix(data) else { return nil }
         return find(URL(filePath: data + path))
+    }
+
+    func heldByClones() -> [Int: Int64] {
+        var families: [Inode: [Int]] = [:]
+        for id in nodes.indices where nodes[id].references > 1 {
+            families[Inode(device: nodes[id].device, number: nodes[id].shared), default: []].append(id)
+        }
+        var held: [Int: Int64] = [:]
+        for members in families.values {
+            guard let owner = members.first(where: { nodes[$0].allocated > 0 }) else { continue }
+            let stop = members.count >= Int(nodes[owner].references) ? commonAncestor(of: members) : -1
+            var node = owner
+            while node >= 0, node != stop {
+                held[node, default: 0] += nodes[owner].allocated
+                node = Int(nodes[node].parent)
+            }
+        }
+        return held
+    }
+
+    func reclaimable(_ id: Int, held: [Int: Int64]) -> Int64 {
+        nodes[id].allocated - held[id, default: 0]
+    }
+
+    private func commonAncestor(of members: [Int]) -> Int {
+        var path: [Int] = []
+        var node = members[0]
+        while node >= 0 {
+            path.append(node)
+            node = Int(nodes[node].parent)
+        }
+        let position = Dictionary(uniqueKeysWithValues: path.enumerated().map { ($1, $0) })
+        var highest = 0
+        for member in members.dropFirst() {
+            var node = member
+            while node >= 0, position[node] == nil { node = Int(nodes[node].parent) }
+            guard node >= 0, let index = position[node] else { return -1 }
+            highest = max(highest, index)
+        }
+        return path[highest]
     }
 
     func displayPath(of id: Int) -> String {

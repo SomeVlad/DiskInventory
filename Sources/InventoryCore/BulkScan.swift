@@ -9,7 +9,8 @@ enum BulkScan {
         let directory: Bool
         let symlink: Bool
         let regular: Bool
-        let hardLink: Bool
+        let shared: UInt64
+        let references: UInt32
         let logical: Int64
         let allocated: Int64
 
@@ -20,18 +21,22 @@ enum BulkScan {
             directory = type == S_IFDIR
             symlink = type == S_IFLNK
             regular = type == S_IFREG
-            hardLink = regular && info.st_nlink > 1
+            shared = regular && info.st_nlink > 1 ? info.st_ino : 0
+            references = 0
             logical = directory ? 0 : max(0, info.st_size)
             allocated = directory ? 0 : max(0, info.st_blocks) * 512
         }
 
-        init(device: Int32, inode: UInt64, type: UInt32, links: UInt32, logical: Int64, allocated: Int64) {
+        init(device: Int32, inode: UInt64, type: UInt32, links: UInt32, logical: Int64, allocated: Int64,
+             clone: UInt64 = 0, cloneReferences: UInt32 = 0) {
             self.device = device
             self.inode = inode
             directory = type == VDIR.rawValue
             symlink = type == VLNK.rawValue
             regular = type == VREG.rawValue
-            hardLink = regular && links > 1
+            let cloned = regular && cloneReferences > 1 && clone != 0
+            shared = cloned ? clone | 1 << 63 : regular && links > 1 ? inode : 0
+            references = cloned ? cloneReferences : 0
             self.logical = max(0, logical)
             self.allocated = max(0, allocated)
         }
@@ -241,7 +246,7 @@ enum BulkScan {
         let unitKind = index == 0 ? catalog.kind(name: unit.name, directory: true, symlink: false, alias: false) : 0
         var nodes = [FileNode(
             name: unit.name, parent: -1, kind: unitKind, device: unit.device, inode: unit.inode,
-            isDirectory: true, logical: 0, allocated: 0, rawAllocated: 0, isHardLink: false
+            isDirectory: true, logical: 0, allocated: 0, rawAllocated: 0, shared: 0
         )]
 
         func report(_ path: @autoclosure () -> String, _ code: Int32) {
@@ -290,16 +295,23 @@ enum BulkScan {
         }
         attributes.dirattr = UInt32(ATTR_DIR_MOUNTSTATUS)
         attributes.fileattr = file
+        attributes.forkattr = UInt32(ATTR_CMNEXT_CLONEID | ATTR_CMNEXT_CLONE_REFCNT)
+        var options = UInt64(FSOPT_RETURN_REALDEV | FSOPT_ATTR_CMN_EXTENDED)
 
         func enumerate(_ fd: Int32, parent: Int) throws {
             while true {
                 try coordinator.checkCancellation()
                 let before = nodes.count
                 var batchBytes: Int64 = 0
-                let count = getattrlistbulk(fd, &attributes, buffer.baseAddress, buffer.count, UInt64(FSOPT_RETURN_REALDEV))
+                let count = getattrlistbulk(fd, &attributes, buffer.baseAddress, buffer.count, options)
                 if count == 0 { return }
                 if count < 0 {
                     let code = errno
+                    if code == EINVAL, attributes.forkattr != 0 {
+                        attributes.forkattr = 0
+                        options = UInt64(FSOPT_RETURN_REALDEV)
+                        continue
+                    }
                     if code == EACCES || code == EPERM {
                         if index == 0, parent == 0 { throw ScanError.filesystem(unit.path, code) }
                         report(path(for: parent), code)
@@ -355,7 +367,10 @@ enum BulkScan {
                             let links = try record.take(UInt32.self)
                             let allocated = try record.take(Int64.self)
                             let logical = try record.take(Int64.self)
-                            metadata = Metadata(device: device, inode: inode, type: type, links: links, logical: logical, allocated: allocated)
+                            let clone = returned.forkattr & UInt32(ATTR_CMNEXT_CLONEID) != 0 ? try record.take(UInt64.self) : 0
+                            let cloneReferences = returned.forkattr & UInt32(ATTR_CMNEXT_CLONE_REFCNT) != 0 ? try record.take(UInt32.self) : 0
+                            metadata = Metadata(device: device, inode: inode, type: type, links: links, logical: logical, allocated: allocated,
+                                                clone: clone, cloneReferences: cloneReferences)
                         }
                     } else {
                         var info = stat()
@@ -379,10 +394,10 @@ enum BulkScan {
                                             alias: metadata.regular && name.hasSuffix(".alias"))
                     }
                     nodes.append(FileNode(
-                        name: name, parent: Int32(parent), kind: kind, device: metadata.device, inode: metadata.inode,
+                        name: name, parent: Int32(parent), kind: kind, device: metadata.device, references: metadata.references, inode: metadata.inode,
                         isDirectory: metadata.directory, nextSibling: nodes[parent].firstChild,
                         logical: metadata.logical, allocated: metadata.allocated,
-                        rawAllocated: metadata.allocated, isHardLink: metadata.hardLink, fileCount: metadata.directory ? 0 : 1
+                        rawAllocated: metadata.allocated, shared: metadata.shared, fileCount: metadata.directory ? 0 : 1
                     ))
                     nodes[parent].firstChild = Int32(id)
                     batchBytes += metadata.allocated
@@ -492,7 +507,7 @@ enum BulkScan {
                 node.firstChild = global(node.firstChild)
                 node.nextSibling = global(node.nextSibling)
                 node.kind = kindMap[Int(node.kind)]
-                if node.isHardLink, !seenLinks.insert(Inode(device: node.device, number: node.inode)).inserted {
+                if node.isShared, !seenLinks.insert(Inode(device: node.device, number: node.shared)).inserted {
                     node.allocated = 0
                 }
                 nodes.append(node)

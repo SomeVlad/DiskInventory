@@ -139,3 +139,32 @@ private func temporaryHome() throws -> URL {
     #expect(AdviceGuard.refusal(for: "/Library/Fonts", verdict: .review) != nil)
     #expect(AdviceGuard.refusal(for: "/Library/Application Support", verdict: .review) != nil)
 }
+
+@Test func clonesCountOnceAndFreeSpaceOnlyWithEveryCopy() throws {
+    let root = try temporaryHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let original = root.appending(path: "a/original.bin")
+    try makeFile(original, bytes: 4 << 20)
+    for copy in ["b/copy.bin", "c/copy.bin"] {
+        let target = root.appending(path: copy)
+        try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+        #expect(clonefile(original.path, target.path, 0) == 0)
+    }
+    try makeFile(root.appending(path: "solo.bin"), bytes: 1 << 20)
+
+    let snapshot = try InventoryScanner.scan(root)
+    let total = snapshot.nodes[0].allocated
+    #expect(total >= 5 << 20 && total < 6 << 20)
+    let held = snapshot.heldByClones()
+    #expect(snapshot.reclaimable(0, held: held) == total)
+    for folder in ["a", "b", "c"] {
+        let id = try #require(snapshot.locate(root.appending(path: folder).path))
+        #expect(snapshot.reclaimable(id, held: held) == 0)
+    }
+
+    let owner = try #require(["a/original.bin", "b/copy.bin", "c/copy.bin"]
+        .compactMap { snapshot.locate(root.appending(path: $0).path) }
+        .first { snapshot.nodes[$0].allocated > 0 })
+    let after = try InventoryScanner.removing(owner, from: snapshot)
+    #expect(after.nodes[0].allocated == total)
+}

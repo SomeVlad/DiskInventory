@@ -17,6 +17,7 @@ public struct FileNode: Sendable {
     public var parent: Int32
     public var kind: Int32
     public let device: Int32
+    var references: UInt32 = 0
     public let inode: UInt64
     public let isDirectory: Bool
     public var firstChild: Int32 = -1
@@ -24,8 +25,11 @@ public struct FileNode: Sendable {
     public var logical: Int64
     public var allocated: Int64
     let rawAllocated: Int64
-    let isHardLink: Bool
+    let shared: UInt64
     public var fileCount: Int = 0
+
+    var isShared: Bool { shared != 0 }
+    var identity: UInt64 { isShared ? shared : inode }
 
     public func size(_ mode: SizeMode) -> Int64 {
         mode == .allocated ? allocated : logical
@@ -382,7 +386,7 @@ public enum InventoryScanner {
             var node = FileNode(
                 name: displayName, parent: Int32(parent), kind: kind, device: attributes.st_dev, inode: attributes.st_ino,
                 isDirectory: directory, logical: logical, allocated: allocated,
-                rawAllocated: rawAllocated, isHardLink: isHardLink, fileCount: directory ? 0 : 1
+                rawAllocated: rawAllocated, shared: isHardLink ? attributes.st_ino : 0, fileCount: directory ? 0 : 1
             )
             if parent >= 0 {
                 node.nextSibling = nodes[parent].firstChild
@@ -439,7 +443,7 @@ public enum InventoryScanner {
     public static func removing(_ id: Int, from previous: ScanSummary) throws -> ScanSummary {
         guard id > 0, previous.nodes.indices.contains(id) else { return previous }
         let item = previous.nodes[id]
-        guard !item.isDirectory, !item.isHardLink else {
+        guard !item.isDirectory, !item.isShared else {
             return try replacing(id, in: previous, with: nil)
         }
         try Task.checkCancellation()
@@ -458,7 +462,7 @@ public enum InventoryScanner {
             nodes[Int(sibling)].nextSibling = item.nextSibling
         }
         nodes[id] = FileNode(name: "", parent: -1, kind: 0, device: 0, inode: 0, isDirectory: false,
-                             logical: 0, allocated: 0, rawAllocated: 0, isHardLink: false)
+                             logical: 0, allocated: 0, rawAllocated: 0, shared: 0)
         var ancestor = parent
         while ancestor >= 0 {
             nodes[ancestor].logical -= item.logical
@@ -496,8 +500,8 @@ public enum InventoryScanner {
         var linked = Set<Inode>()
         var possibleLinks = Set<Inode>()
         for group in [previous.nodes, replacement?.nodes ?? []] {
-            for node in group where node.isHardLink {
-                possibleLinks.insert(Inode(device: node.device, number: node.inode))
+            for node in group where node.isShared {
+                possibleLinks.insert(Inode(device: node.device, number: node.shared))
             }
         }
         while let entry = work.popLast() {
@@ -524,7 +528,7 @@ public enum InventoryScanner {
                 node.allocated = 0
                 node.fileCount = 0
             } else {
-                let identity = Inode(device: node.device, number: node.inode)
+                let identity = Inode(device: node.device, number: node.identity)
                 let count = !possibleLinks.contains(identity) || linked.insert(identity).inserted
                 node.allocated = count ? node.rawAllocated : 0
             }

@@ -62,6 +62,7 @@ struct StoredScan {
     let finderKinds: Bool
     let seconds: Double
     let finishedAt: Date
+    let held: [Int: Int64]
 
     var summary: [String: Any] {
         let root = snapshot.nodes[0]
@@ -127,8 +128,9 @@ func scanArguments(_ params: Params, store: ScanStore, defaultPath: String = "~"
         finished.wait()
         throw ToolFailure("the scan of \(path) was still running after \(Int(maxSeconds)) s; raise max_seconds or scan a smaller folder")
     }
-    let scan = StoredScan(snapshot: try outcome.result!.get(), path: path, finderKinds: finderKinds,
-                          seconds: Date().timeIntervalSince(started), finishedAt: Date())
+    let snapshot = try outcome.result!.get()
+    let scan = StoredScan(snapshot: snapshot, path: path, finderKinds: finderKinds,
+                          seconds: Date().timeIntervalSince(started), finishedAt: Date(), held: snapshot.heldByClones())
     store.store(scan)
     return scan
 }
@@ -156,7 +158,8 @@ func focus(_ params: Params, in scan: StoredScan) throws -> Int {
     return id
 }
 
-func entryJSON(_ snapshot: ScanSummary, _ id: Int, mode: SizeMode, total: Int64) -> [String: Any] {
+func entryJSON(_ scan: StoredScan, _ id: Int, mode: SizeMode, total: Int64) -> [String: Any] {
+    let snapshot = scan.snapshot
     let node = snapshot.nodes[id]
     let size = node.size(mode)
     var json: [String: Any] = [
@@ -167,6 +170,10 @@ func entryJSON(_ snapshot: ScanSummary, _ id: Int, mode: SizeMode, total: Int64)
         "share_percent": percent(size, of: total),
     ]
     if node.isDirectory { json["files"] = node.fileCount }
+    if mode == .allocated, let held = scan.held[id], held > 0 {
+        json["frees_if_deleted"] = snapshot.reclaimable(id, held: scan.held)
+        json["frees_if_deleted_h"] = human(snapshot.reclaimable(id, held: scan.held))
+    }
     return json
 }
 
@@ -205,12 +212,13 @@ private let formatterISO: ISO8601DateFormatter = {
 
 func adviceSize(_ path: String, store: ScanStore) -> Int64 {
     for scan in store.all {
-        if let id = scan.snapshot.locate(path) { return scan.snapshot.nodes[id].allocated }
+        if let id = scan.snapshot.locate(path) { return scan.snapshot.reclaimable(id, held: scan.held) }
     }
     var info = stat()
     guard lstat(path, &info) == 0 else { return 0 }
     guard info.st_mode & S_IFMT == S_IFDIR else { return Int64(info.st_blocks) * 512 }
-    return (try? InventoryScanner.scan(URL(filePath: path, directoryHint: .isDirectory)).nodes[0].allocated) ?? 0
+    guard let scanned = try? InventoryScanner.scan(URL(filePath: path, directoryHint: .isDirectory)) else { return 0 }
+    return scanned.reclaimable(0, held: scanned.heldByClones())
 }
 
 func adviceJSON(_ sheet: AdviceSheet?) -> [String: Any] {
@@ -284,7 +292,7 @@ func makeTools(_ store: ScanStore) -> [Tool] {
             let children = snapshot.children(of: 0).sorted { snapshot.nodes[$0].allocated > snapshot.nodes[$1].allocated }
             return [
                 "scan": scan.summary,
-                "top": children.prefix(limit).map { entryJSON(snapshot, $0, mode: .allocated, total: total) },
+                "top": children.prefix(limit).map { entryJSON(scan, $0, mode: .allocated, total: total) },
                 "skipped_examples": snapshot.issues.prefix(15).map { ["path": $0.path, "reason": $0.message] },
             ]
         },
@@ -306,9 +314,9 @@ func makeTools(_ store: ScanStore) -> [Tool] {
             let total = snapshot.nodes[id].size(mode)
             let children = snapshot.children(of: id).sorted { snapshot.nodes[$0].size(mode) > snapshot.nodes[$1].size(mode) }
             return [
-                "folder": entryJSON(snapshot, id, mode: mode, total: total),
+                "folder": entryJSON(scan, id, mode: mode, total: total),
                 "count": children.count,
-                "items": children.prefix(limit).map { entryJSON(snapshot, $0, mode: mode, total: total) },
+                "items": children.prefix(limit).map { entryJSON(scan, $0, mode: mode, total: total) },
             ]
         },
 
@@ -332,7 +340,7 @@ func makeTools(_ store: ScanStore) -> [Tool] {
                 kind == "both" || (kind == "folders") == node.isDirectory
             }
             let total = snapshot.nodes[id].size(mode)
-            return ["under": snapshot.displayPath(of: id), "kind": kind, "items": ids.map { entryJSON(snapshot, $0, mode: mode, total: total) }]
+            return ["under": snapshot.displayPath(of: id), "kind": kind, "items": ids.map { entryJSON(scan, $0, mode: mode, total: total) }]
         },
 
         syncTool(
@@ -370,7 +378,7 @@ func makeTools(_ store: ScanStore) -> [Tool] {
                         "size_h": human(entry.size),
                         "files": entry.count,
                         "share_percent": percent(entry.size, of: total),
-                        "biggest": entryJSON(snapshot, entry.biggest, mode: mode, total: total),
+                        "biggest": entryJSON(scan, entry.biggest, mode: mode, total: total),
                     ]
                 },
             ]
@@ -400,7 +408,7 @@ func makeTools(_ store: ScanStore) -> [Tool] {
             let limit = try params.count("limit", fallback: 30, limit: 500)
             let matches = try snapshot.search(query, field: field, kind: nil, options: options)
             let total = snapshot.nodes[0].size(options.mode)
-            return ["found": matches.count, "items": matches.prefix(limit).map { entryJSON(snapshot, $0, mode: options.mode, total: total) }]
+            return ["found": matches.count, "items": matches.prefix(limit).map { entryJSON(scan, $0, mode: options.mode, total: total) }]
         },
 
         syncTool(
