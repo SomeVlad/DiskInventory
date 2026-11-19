@@ -1,135 +1,60 @@
 # Disk Inventory
 
-Нативный порт Disk Inventory X для macOS 26 и Apple Silicon: карта занятого места, дерево и типы файлов, уборка (что можно удалить и что давно не открывали) и MCP-сервер, через который агент видит тот же скан.
+[![Release](https://img.shields.io/github/v/release/kpeeem/DiskInventory)](https://github.com/kpeeem/DiskInventory/releases/latest)
+[![License](https://img.shields.io/github/license/kpeeem/DiskInventory)](LICENSE)
+![macOS 26+](https://img.shields.io/badge/macOS-26%2B-black)
 
-![Главное окно: дерево, карта и типы файлов](Research/Screenshots/main-window.jpg)
+English · [Русский](README.ru.md)
 
-![Тёмная тема: акцентное выделение и заголовки папок на карте](Research/Screenshots/main-window-dark.jpg)
+> **TL;DR** — A native Swift remake of Disk Inventory X for Apple Silicon: a treemap of every file, a Clean Up tab that sorts junk by how safe it is to delete, and an MCP server so Claude can scan your disk and send its cleanup advice straight into the app. Nothing is deleted until you confirm.
 
-## Быстрый старт
+![Disk Inventory: tree, treemap and file kinds](Research/Screenshots/main-window.jpg)
 
-```sh
-git clone https://github.com/kpeeem/DiskInventory.git
-```
+## Install
 
-```sh
-cd DiskInventory && ./Scripts/build-app.sh
-```
-
-```sh
-open "dist/Disk Inventory.app"
-```
-
-Нужны Xcode 27 и macOS 26. Скрипт подписывает приложение первым сертификатом из Связки ключей (если его нет — ad hoc), поэтому «Полный доступ к диску» не слетает после пересборки. Без этого доступа защищённые папки попадут в **skipped**.
-
-MCP-сервер для Claude Code:
+1. Download `DiskInventory-*.zip` from [Releases](https://github.com/kpeeem/DiskInventory/releases/latest) and move the app to Applications.
+2. The build is not notarized. On first launch open **System Settings → Privacy & Security → Open Anyway**, or run:
 
 ```sh
-./Scripts/build-mcp.sh
+xattr -dr com.apple.quarantine "/Applications/Disk Inventory.app"
 ```
+
+3. Optional: give it **Full Disk Access** to see Mail, Messages and parts of Library.
+
+Build from source (Xcode 26+, macOS 26):
 
 ```sh
-claude mcp add --scope user inventory "$PWD/dist/inventorymcp"
+git clone https://github.com/kpeeem/DiskInventory.git && cd DiskInventory && ./Scripts/build-app.sh && open "dist/Disk Inventory.app"
 ```
 
-## Уборка и советы Claude
+## What it does
 
-Вкладка **Clean Up** в инспекторе (или **File → Clean Up…**, ⇧⌘K, или кнопка в тулбаре). Пока она открыта, карта приглушает всё, кроме кандидатов; выбор строки выделяет объект в дереве и на карте, пробел открывает Quick Look.
+- **Treemap + tree + kinds.** One selection across all three, zoom with double-click, Quick Look with Space.
+- **Fast.** Parallel APFS scan with `getattrlistbulk`: 8 million files in about two minutes, iCloud placeholders never downloaded.
+- **Clean Up.** Caches, build artifacts, installers, old simulators and files nobody opened for months, grouped by risk.
 
-![Вкладка Clean Up со советами Claude и подсветкой на карте](Research/Screenshots/cleanup-tab.jpg)
+![Clean Up tab with Claude's advice and allowlisted actions](Research/Screenshots/cleanup-tab.jpg)
 
-- **Claude’s Analysis** — то, что прислал агент через `inventory_advise`: путь, размер, вердикт (*safe*, *regenerable*, *review*, *keep*) и объяснение, почему это безопасно. Безопасные пункты отмечены заранее, «keep» удалить нельзя, через контекстное меню можно сказать «Keep».
-- **Правила приложения**: *Safe to Remove* — кэши программ, журналы, Корзина (её очищают в Finder); *Rebuilt on Demand* — `node_modules`, `.build`, `target`, виртуальные окружения Python и прочие артефакты рядом с файлом проекта, кэши npm/uv/pip/Gradle/Cargo, DerivedData; *Worth a Look* — установщики в Загрузках и на Рабочем столе, локальные модели, устройства симулятора, архивы Xcode, резервные копии iPhone. Внутри `~/Library` (кроме перечисленных мест), скрытых папок домашней и пакетов приложений артефакты не ищутся.
-- **Not Opened Lately** — крупные файлы в Desktop, Documents, Downloads, Movies, Music, Pictures и iCloud Drive, которые не открывали и не меняли дольше выбранного срока (дата — самая поздняя из «открыт» по Spotlight, «изменён» и «добавлен»). Их можно перенести в iCloud Drive или Google Drive в папку «Archived from Mac», а у файлов из iCloud — убрать локальную копию.
-
-Всё уходит в Корзину только после подтверждения; скан обновляется точечно, а статусы советов (перемещено, оставлено) видны агенту.
-
-### Как это работает с агентом
-
-1. Вы спрашиваете Claude «чем забит диск, что почистить».
-2. Claude меряет через `inventory_scan` / `inventory_cleanup` / `inventory_stale` и отправляет выводы `inventory_advise` — приложение открывается на вкладке Clean Up.
-3. Вы отмечаете, что удалить, и подтверждаете; `inventory_advice` показывает агенту, что вы перенесли в Корзину и что оставили.
-
-Советы хранятся в `~/Library/Application Support/DiskAdvice/advice.json` и объявляются распределённым уведомлением, поэтому их видит и DiskSpot. Целые `~/Library`, `~/Documents`, `~/Dev` отклоняются для любого вердикта, кроме «keep».
-
-### Вне домашней папки
-
-`inventory_system` меряет то, что лежит вне `~`: `/Library/Caches`, `/Library/Logs`, кэши симулятора, временные папки пользователя в `/private/var/folders`, `/private/tmp`, `/Users/Shared`, Корзину, среды выполнения и устройства симулятора (с тем, кто какой средой пользуется), Homebrew, Docker, локальные снимки Time Machine и 60 самых больших программ с числом дней с последнего запуска.
-
-Совет бывает двух видов:
-
-- **путь** — его можно отправить в Корзину. Кэши, журналы и временные файлы вне `~` принимают любой вердикт; программы в `/Applications` и папки производителей в `/Library` — только *review*; `/System`, `/usr`, `/opt/homebrew`, `/Library/Preferences`, `LaunchDaemons`, `Extensions` и прочая системная настройка отклоняются. То, что принадлежит системе, переносит Finder и сам спрашивает пароль администратора;
-- **действие** из закрытого списка — `brew-cleanup`, `brew-uninstall-cask`, `simctl-delete-unavailable`, `simctl-delete-device`, `simctl-runtime-delete`, `docker-prune`, `empty-trash`. Агент выбирает только действие и аргумент (имя cask, UDID симулятора, идентификатор среды), MCP проверяет, что такой cask, симулятор или среда есть, и считает, сколько освободится. В строке совета кнопка **Run…**: перед запуском приложение показывает точную команду; результат и вывод команды видны и в строке, и агенту.
-
-Произвольные команды агент передать не может, и сам ничего не удаляет и не запускает.
-
-## Сканирование
-
-На APFS обход параллельный: общая очередь папок, свободные потоки забирают поддеревья, до которых занятые ещё не дошли; атрибуты читаются пакетами через `getattrlistbulk`, а части скана сливаются с перенумерацией узлов и однократным учётом hard links. Выгруженные в iCloud (dataless) папки учитываются, но не открываются, так что скан ничего не скачивает.
-
-| Каталог | Записей | 1.5, один поток | 1.6, очередь |
-|---|---:|---:|---:|
-| `/Applications/Xcode.app/Contents/Developer` | 152 452 | 1,3–2,5 с | 1,0–1,6 с |
-| `~/Dev` | 3,9 млн | 121 с | 31 с |
-| `~` целиком | 8,2 млн | около часа в 1.3 | 132 с |
-
-Число записей и байты совпадают с последовательным обходом; пик памяти на `~/Dev` — 1,0 ГБ против 0,75 ГБ (части скана живут до слияния).
-
-## MCP
-
-`inventorymcp` держит скан в памяти 30 минут. Файлов он не удаляет — только читает и передаёт советы в приложение:
-
-| Инструмент | Что делает |
-|---|---|
-| `inventory_scan` | полный скан папки или тома (`/System/Volumes/Data` — весь загрузочный том) |
-| `inventory_children`, `inventory_top` | обход по уровням и самые большие файлы или папки где угодно внутри |
-| `inventory_kinds`, `inventory_search` | место по типам файлов и поиск по имени, типу или пути |
-| `inventory_cleanup` | то же, что вкладка Remove, с суммами по уровням безопасности |
-| `inventory_stale` | то же, что вкладка Move to Cloud, плюс найденные облачные папки |
-| `inventory_status` | доступ к защищённым папкам, облачные папки, сканы в памяти |
-| `inventory_advise`, `inventory_advice`, `inventory_advice_clear`, `inventory_show_cleanup` | отправить советы во вкладку Clean Up, прочитать решения пользователя, убрать советы, открыть вкладку |
-| `inventory_system` | что занимает место вне домашней папки, программы, которые давно не запускали, и список разрешённых действий |
-
-## Работа с картой
-
-- Площадь прямоугольника пропорциональна размеру; у достаточно крупных папок есть заголовок с именем и размером. Дерево, карта и списки показывают одно выделение (акцентная рамка). Двойной клик или Return приближает папку, путь над картой и ⌘↑ возвращают назад, стрелки переходят между плитками, пробел открывает Quick Look.
-- **Kinds** показывает размеры по типам файлов; цвета карты даны по категориям (видео, изображения, программы, разработка, документы, данные…). Выбор типа подсвечивает его плитки.
-- **Largest Files** — файлы по размеру; поиск по имени, типу или папке живёт в поле тулбара, совпадения подсвечиваются на карте.
-- Открытие, Quick Look, Finder, Get Info (немодальная панель), копирование пути, приближение, **Rescan Selection** и перенос в Корзину — в контекстном меню. **Rescan** (⌥⌘R) пересканирует окно.
-- В меню **View** переключаются размер на диске и логический размер, содержимое пакетов, свободное и прочее место, **Show/Hide Inspector**, **Show Largest Files**.
-- При выборе загрузочного тома сканируется его записываемая часть APFS (окно называется по тому). Для тома показывается процент по объёму и признак «ждёт доступа», если macOS задерживает чтение папки. Перед сканом тома без Full Disk Access приложение предлагает его включить; пропуски сгруппированы по причине с кнопкой **Open Privacy Settings**.
-
-## Настройки
-
-**Disk Inventory → Settings… (⌘,)** — вкладки в тулбаре.
-
-- **Appearance** — четыре палитры карты с предпросмотром (без фиолетовых тонов), подписи, границы папок, расположение панелей и компактный текст дерева. Светлая и тёмная тема — по системной настройке.
-- **Scanning** — размер на диске или логический размер, содержимое пакетов, названия типов Finder и показ свободного и прочего места.
-- **Behavior** — анимация зума, синхронизация с Finder, подтверждение переноса в Корзину и напоминание о Full Disk Access.
-
-## Проверка
+## Ask Claude what to clean
 
 ```sh
-CLANG_MODULE_CACHE_PATH="$PWD/.build/module-cache" swift test --disable-sandbox --cache-path "$PWD/.build/cache"
+./Scripts/build-mcp.sh && claude mcp add --scope user inventory "$PWD/dist/inventorymcp"
 ```
 
-Сквозные проверки окна (выбор томов, скан, синхронизация, зум, поиск, раскладка, настройки, Корзина):
+Then ask *“what fills my disk, what can I delete?”*. Claude measures with `inventory_scan` and `inventory_system` and sends each finding with a verdict and a reason; the app highlights it on the map. You tick what goes; Claude reads back what you did.
 
-```sh
-binary="dist/Disk Inventory.app/Contents/MacOS/DiskInventory"
-"$binary" --smoke-test /path/to/folder
-"$binary" --layout-smoke-test /path/to/folder
-"$binary" --settings-smoke-test /path/to/folder
-"$binary" --trash-smoke-test
-```
+> [!IMPORTANT]
+> The agent never deletes anything. Paths go to the Trash only after you confirm. Commands come from a fixed allowlist (`brew cleanup`, `simctl delete`, `docker prune`…), and the app shows the exact command before **Run…**. `/System`, `/usr` and system settings are refused.
 
-CLI сканирует метаданные без открытия окна. Флаг `--finder-kinds` включает подробные имена типов для `--scan` и `--fts`. Ключ `--fts` запускает прежний файловый обход для сравнения. Ключ `--baseline` обходит дерево через Foundation и считает число объектов и логические байты.
+<details>
+<summary>Dark appearance</summary>
 
-```sh
-binary="dist/Disk Inventory.app/Contents/MacOS/DiskInventory"
-"$binary" --scan /Applications/Xcode.app/Contents/Developer
-"$binary" --fts /Applications/Xcode.app/Contents/Developer
-"$binary" --baseline /Applications/Xcode.app/Contents/Developer
-```
+![Dark appearance](Research/Screenshots/main-window-dark.jpg)
 
-[Разбор установленной Disk Inventory X 1.3 и замеры](Research/analysis.md).
+</details>
+
+More: [rules, MCP tools, scanning benchmarks, tests](docs/details.md) · Sister app: [DiskSpot](https://github.com/kpeeem/DiskSpot)
+
+## License
+
+[MIT](LICENSE). Not affiliated with the original Disk Inventory X by Tjark Derlien.
