@@ -283,7 +283,7 @@ struct CleanupPanel: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.vertical, 2)
                 }
-                ForEach(advice.items) { item in
+                ForEach(advice.items.filter { $0.status == .pending } + advice.items.filter { $0.status != .pending }) { item in
                     AdviceRow(model: model, item: item) { confirmRun = $0 }.tag(item.path.isEmpty ? nil : item.path)
                 }
             } header: {
