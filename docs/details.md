@@ -24,7 +24,7 @@ An advice item is either
 
 ## Scanning
 
-On APFS the walk is parallel: a shared folder queue, attributes read in batches with `getattrlistbulk`, partial scans merged with node renumbering, hard links counted once. iCloud placeholders (dataless folders) are counted but never opened, so a scan downloads nothing.
+On APFS the walk is parallel: a shared folder queue, attributes read in batches with `getattrlistbulk`, partial scans merged with node renumbering, hard links and APFS clones counted once. Deleting a clone frees nothing while another copy exists, so cleanup sizes and the MCP report only what deleting would really free (`frees_if_deleted`). iCloud placeholders (dataless folders) are counted but never opened, so a scan downloads nothing.
 
 | Folder | Entries | 1.5, one thread | 1.6, queue |
 |---|---:|---:|---:|
