@@ -50,7 +50,18 @@ claude mcp add --scope user inventory "$PWD/dist/inventorymcp"
 2. Claude меряет через `inventory_scan` / `inventory_cleanup` / `inventory_stale` и отправляет выводы `inventory_advise` — приложение открывается на вкладке Clean Up.
 3. Вы отмечаете, что удалить, и подтверждаете; `inventory_advice` показывает агенту, что вы перенесли в Корзину и что оставили.
 
-Советы хранятся в `~/Library/Application Support/DiskAdvice/advice.json` и объявляются распределённым уведомлением, поэтому их видит и DiskSpot. Пути вне домашней папки и известных кэшей, а также целые `~/Library`, `~/Documents`, `~/Dev` отклоняются для любого вердикта, кроме «keep».
+Советы хранятся в `~/Library/Application Support/DiskAdvice/advice.json` и объявляются распределённым уведомлением, поэтому их видит и DiskSpot. Целые `~/Library`, `~/Documents`, `~/Dev` отклоняются для любого вердикта, кроме «keep».
+
+### Вне домашней папки
+
+`inventory_system` меряет то, что лежит вне `~`: `/Library/Caches`, `/Library/Logs`, кэши симулятора, временные папки пользователя в `/private/var/folders`, `/private/tmp`, `/Users/Shared`, Корзину, среды выполнения и устройства симулятора (с тем, кто какой средой пользуется), Homebrew, Docker, локальные снимки Time Machine и 60 самых больших программ с числом дней с последнего запуска.
+
+Совет бывает двух видов:
+
+- **путь** — его можно отправить в Корзину. Кэши, журналы и временные файлы вне `~` принимают любой вердикт; программы в `/Applications` и папки производителей в `/Library` — только *review*; `/System`, `/usr`, `/opt/homebrew`, `/Library/Preferences`, `LaunchDaemons`, `Extensions` и прочая системная настройка отклоняются. То, что принадлежит системе, переносит Finder и сам спрашивает пароль администратора;
+- **действие** из закрытого списка — `brew-cleanup`, `brew-uninstall-cask`, `simctl-delete-unavailable`, `simctl-delete-device`, `simctl-runtime-delete`, `docker-prune`, `empty-trash`. Агент выбирает только действие и аргумент (имя cask, UDID симулятора, идентификатор среды), MCP проверяет, что такой cask, симулятор или среда есть, и считает, сколько освободится. В строке совета кнопка **Run…**: перед запуском приложение показывает точную команду; результат и вывод команды видны и в строке, и агенту.
+
+Произвольные команды агент передать не может, и сам ничего не удаляет и не запускает.
 
 ## Сканирование
 
@@ -77,6 +88,7 @@ claude mcp add --scope user inventory "$PWD/dist/inventorymcp"
 | `inventory_stale` | то же, что вкладка Move to Cloud, плюс найденные облачные папки |
 | `inventory_status` | доступ к защищённым папкам, облачные папки, сканы в памяти |
 | `inventory_advise`, `inventory_advice`, `inventory_advice_clear`, `inventory_show_cleanup` | отправить советы во вкладку Clean Up, прочитать решения пользователя, убрать советы, открыть вкладку |
+| `inventory_system` | что занимает место вне домашней папки, программы, которые давно не запускали, и список разрешённых действий |
 
 ## Работа с картой
 
