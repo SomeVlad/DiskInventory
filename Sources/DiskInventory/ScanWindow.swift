@@ -542,7 +542,16 @@ import SwiftUI
                 self.stack = result.stack
                 self.selected = result.selected
                 self.renderAll(reusePalette: afterTrash)
-                if self.details.cleaning, let snapshot = self.snapshot { self.cleanupModel?.update(snapshot: snapshot) } else { self.cleanupNeedsUpdate = true }
+                if self.details.cleaning {
+                    if self.cleanupModel == nil {
+                        self.prepareCleanup()
+                    } else if let snapshot = self.snapshot {
+                        self.cleanupModel?.update(snapshot: snapshot)
+                    }
+                    self.updateMapEmphasis()
+                } else {
+                    self.cleanupNeedsUpdate = true
+                }
             } catch is CancellationError {
                 self.updateStatus()
                 self.showPlaceholder(MapPlaceholder(title: "Scan Canceled", symbol: "xmark.circle", action: "Scan Again")) { [weak self] in self?.scan() }

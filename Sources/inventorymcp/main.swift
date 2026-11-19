@@ -22,6 +22,12 @@ they could go to. Both are read-only.
 
 The default scan is the home folder; the whole boot volume is /System/Volumes/Data. \
 A scan is reused for 30 minutes; pass refresh to scan again.
+
+Cleanup with the user: when asked what to clean, measure first, then call \
+inventory_advise with every candidate, a verdict and a reason in the user's \
+language. Disk Inventory shows it on its Clean Up tab, highlights it on the map, \
+and the user removes what they agree with; inventory_advice reports what was \
+trashed or kept. Never delete files yourself.
 """
 
 let arguments = Array(CommandLine.arguments.dropFirst())

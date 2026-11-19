@@ -22,7 +22,10 @@ import InventoryCore
     private let resultsScroll = NSScrollView()
     private let searchBar = NSStackView()
     private let usageView = NSHostingView(rootView: AnyView(EmptyView()))
-    private let cleanupHost = NSHostingView(rootView: AnyView(EmptyView()))
+    private let cleanupHost = NSHostingView(rootView: AnyView(
+        ContentUnavailableView("Waiting for the Scan", systemImage: "hourglass",
+                               description: Text("Clean-up suggestions and Claude’s advice appear when the scan finishes"))
+    ))
     private let noResults = NSHostingView(rootView: ContentUnavailableView("No Results", systemImage: "magnifyingglass", description: Text("Try another name, kind or folder")))
     private let tableArea = NSView()
     private var searched = false
