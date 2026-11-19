@@ -1,0 +1,988 @@
+import AppKit
+import Darwin
+import InventoryCore
+
+@MainActor func formatSize(_ size: Int64) -> String {
+    size.formatted(.byteCount(style: .file, spellsOutZero: false, includesActualByteCount: false))
+}
+
+@MainActor final class ScanWindow: NSWindowController, NSWindowDelegate, NSToolbarDelegate, NSMenuItemValidation, NSToolbarItemValidation {
+    private struct ScanResult: Sendable {
+        let snapshot: ScanSummary
+        let zoom: Int
+        let stack: [Int]
+        let selected: Int?
+    }
+
+    private let location: URL
+    private(set) var snapshot: ScanSummary?
+    private var options = Settings.options
+    private var ignoreCreator = Settings.bool("ignoreCreator", default: true)
+    private var zoom = 0
+    private var stack: [Int] = []
+    private var selected: Int?
+    private var whileScanning: Task<Void, Never>?
+    private var scanWorker: Task<ScanResult, Error>?
+    private var mapWorker: Task<[MapTile], Error>?
+    private var mapUpdate: Task<Void, Never>?
+    private var totalsWorker: Task<[KindTotal], Error>?
+    private var totalsUpdate: Task<Void, Never>?
+    private var searchWorker: Task<[Int], Error>?
+    private var searchUpdate: Task<Void, Never>?
+    private var generation = UUID()
+    private let documentColors = KindColors()
+    private var palette = Settings.treemapPalette
+    private var shareColors = Settings.bool("shareColors", default: true)
+    private var totals: [KindTotal]?
+    private var colors: [NSColor] = []
+    private let files = FileOutline()
+    private let map = TreemapView(frame: .zero)
+    private let details = Details()
+    private let panes = InventorySplitViewController()
+    private let fileAndMap = InventorySplitViewController()
+    private var didSetUpDividers = false
+    private var detailPane: NSSplitViewItem!
+    private let pathControl = NSPathControl()
+    private let info = NSTextField(labelWithString: "")
+    private let status = NSTextField(labelWithString: "")
+    private let progress = NSProgressIndicator()
+    private let cancel = NSButton(title: "Cancel", target: nil, action: nil)
+    private let issues = NSButton(title: "Scan Issues", target: nil, action: nil)
+    private var rescanningSelection: URL?
+    private var isTrashing = false
+    private var deferredSettings = false
+    private var closed = false
+    var onClose: ((ScanWindow) -> Void)?
+    var canShowScan: Bool { scanWorker != nil || snapshot != nil }
+    var testReady: Bool { scanWorker == nil && snapshot != nil && map.hasTiles }
+
+    func exerciseWorkflow() async -> Bool {
+        func fail(_ stage: String) -> Bool {
+            print("Workflow check failed at \(stage).")
+            return false
+        }
+
+        guard let snapshot else { return fail("scan") }
+        let pair = snapshot.children(of: 0).lazy.compactMap { folder -> (Int, Int)? in
+            guard snapshot.isExpandable(folder, options: self.options),
+                  let file = snapshot.children(of: folder).first(where: { !snapshot.nodes[$0].isDirectory }) else {
+                return nil
+            }
+            return (folder, file)
+        }.first
+        guard let (folder, file) = pair else { return fail("selecting a file in a folder from the test dataset") }
+        select(file)
+        guard await waitUntil({ self.map.selection == file && self.files.selectedID == file }) else {
+            return fail("selection sync")
+        }
+        zoomTo(id: folder)
+        guard zoom == folder, pathControl.url == snapshot.url(for: folder) else { return fail("zoom in") }
+        zoomOut()
+        guard zoom == 0 else { return fail("zoom out") }
+        details.showList(query: snapshot.nodes[file].name)
+        let searchDeadline = ContinuousClock.now + .seconds(10)
+        while !details.containsResult(file), ContinuousClock.now < searchDeadline {
+            try? await Task.sleep(for: .milliseconds(35))
+        }
+        guard details.containsResult(file) else { return fail("name search") }
+        select(file)
+        refreshSelection()
+        let refreshDeadline = ContinuousClock.now + .seconds(10)
+        while scanWorker != nil, ContinuousClock.now < refreshDeadline {
+            try? await Task.sleep(for: .milliseconds(35))
+        }
+        guard scanWorker == nil && selectedURL?.path == snapshot.url(for: file).path else { return fail("refresh") }
+        return true
+    }
+
+    func exerciseLayout() async -> Bool {
+        guard await waitUntil({ self.testReady }), let snapshot else { return false }
+        guard LayoutDiagnostics.exerciseDivider(fileAndMap.splitView),
+              LayoutDiagnostics.exerciseDivider(panes.splitView) else {
+            print("Split divider dragging failed.")
+            return false
+        }
+        let positions = layoutSignature
+        showWindow(nil)
+        guard layoutSignature == positions else {
+            print("Showing the window again reset the layout.")
+            return false
+        }
+        guard LayoutDiagnostics.exerciseColumns(files.view),
+              LayoutDiagnostics.exerciseColumns(details.table) else { return false }
+        let kindsColumns = signature(for: details.table)
+        guard let total = totals?.first else { return false }
+        details.showList(kind: total.kind, query: "")
+        guard LayoutDiagnostics.exerciseColumns(details.table) else { return false }
+        let resultColumns = signature(for: details.table)
+        details.toggleList()
+        guard signature(for: details.table) == kindsColumns else { return false }
+        details.toggleList()
+        guard signature(for: details.table) == resultColumns, details.kind == total.kind else { return false }
+        findFiles()
+        guard details.kind == total.kind else { return false }
+        let folder = snapshot.children(of: 0).first { snapshot.isExpandable($0, options: options) }
+        if let folder, let window {
+            select(folder)
+            guard let key = NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil, characters: "\r",
+                charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36
+            ) else { return false }
+            files.view.keyDown(with: key)
+            guard zoom == folder else { return false }
+            zoomRoot()
+            select(folder)
+            files.view.deselectAll(nil)
+            guard files.selectedID == nil, selected == nil else { return false }
+        }
+        refreshAll()
+        return await waitUntil { self.testReady && self.details.kind != nil && self.details.hasMatches }
+    }
+
+    var layoutSignature: [String] {
+        [panes.splitView, fileAndMap.splitView].map {
+            "\(Int(($0.subviews.first?.frame.width ?? 0).rounded()))"
+        } + signature(for: files.view) + signature(for: details.table)
+    }
+
+    private func signature(for table: NSTableView) -> [String] {
+        table.tableColumns.map { "\($0.identifier.rawValue):\(Int($0.width.rounded()))" }
+    }
+
+    func exerciseVisualSettings() async -> Bool {
+        guard await waitUntil({ self.testReady }), let snapshot,
+              let id = snapshot.children(of: 0).first(where: { !snapshot.nodes[$0].isDirectory }) else { return false }
+        select(id)
+        let token = generation
+        let expectedSelection = selected
+        let store = Settings.store
+
+        for alternative in TreemapPalette.allCases {
+            store.set(alternative.rawValue, forKey: "treemapPalette")
+            let expected = alternative.swatches.map(TreemapPalette.color)
+            guard await waitUntil({
+                self.palette == alternative && self.map.usesAnySwatch(from: expected)
+            }) else { return false }
+        }
+
+        store.set(false, forKey: "treemapLabels")
+        store.set(true, forKey: "treemapFolderBorders")
+        store.set(true, forKey: "smallFont")
+        store.set(true, forKey: "vertical")
+        guard await waitUntil({
+            self.map.mapAppearance == MapAppearance(labels: false, folderBorders: true)
+                && !self.fileAndMap.splitView.isVertical && self.files.isCompact
+        }) else { return false }
+        return generation == token && selected == expectedSelection && scanWorker == nil
+    }
+
+    private func waitUntil(_ condition: () -> Bool) async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(15)
+        while !condition(), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(16))
+        }
+        return condition()
+    }
+
+    func exerciseTrash(in fixture: URL) async throws -> Duration {
+        let deadline = ContinuousClock.now + .seconds(15)
+        while !testReady, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        guard testReady, await exerciseWorkflow() else { throw CocoaError(.fileReadUnknown) }
+        var longest = Duration.zero
+        let ticker = Task { @MainActor in
+            var previous = ContinuousClock.now
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .milliseconds(16)) } catch { return }
+                let now = ContinuousClock.now
+                longest = max(longest, previous.duration(to: now))
+                previous = now
+            }
+        }
+        defer { ticker.cancel() }
+        let paths = [
+            fixture.appending(path: "Dense/item-29999.txt", directoryHint: .notDirectory),
+            fixture.appending(path: "Dense", directoryHint: .isDirectory)
+        ]
+        for url in paths {
+            guard let snapshot, let id = snapshot.find(url) else { throw CocoaError(.fileReadNoSuchFile) }
+            let node = snapshot.nodes[id]
+            let parent = snapshot.url(for: Int(node.parent))
+            select(id)
+            guard await waitUntil({ self.files.selectedID == id }),
+                  let task = trash(url, parent: parent, node: node, id: id) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            guard let resultingURL = try await task.value else { throw CocoaError(.fileWriteUnknown) }
+            let updated = await waitUntil {
+                !self.isTrashing && self.scanWorker == nil && self.snapshot?.find(url) == nil && self.map.hasTiles
+            }
+            let moved = await Task.detached {
+                let manager = FileManager.default
+                let verified = !manager.fileExists(atPath: url.path) && manager.fileExists(atPath: resultingURL.path)
+                if verified { try? manager.removeItem(at: resultingURL) }
+                return verified
+            }.value
+            guard updated, moved else { throw CocoaError(.fileWriteUnknown) }
+        }
+        return longest
+    }
+
+    init(location: URL) {
+        self.location = location
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1190, height: 755),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered, defer: false
+        )
+        super.init(window: window)
+        window.title = location.lastPathComponent.isEmpty ? "Disk Inventory" : location.lastPathComponent
+        window.subtitle = "Disk Inventory"
+        window.minSize = NSSize(width: 815, height: 565)
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        setup(window)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func showWindow(_ sender: Any?) {
+        super.showWindow(sender)
+        guard !didSetUpDividers, let content = window?.contentView else { return }
+        didSetUpDividers = true
+        content.layoutSubtreeIfNeeded()
+        let split = panes.splitView
+        split.setPosition(split.bounds.width - 315, ofDividerAt: 0)
+        split.autosaveName = Settings.layoutName("Panes")
+        content.layoutSubtreeIfNeeded()
+        configureFileSplit()
+    }
+
+    private func configureFileSplit() {
+        let vertical = !Settings.bool("vertical")
+        let split = fileAndMap.splitView
+        if split.isVertical != vertical { split.autosaveName = nil }
+        split.isVertical = vertical
+        fileAndMap.splitViewItems[0].minimumThickness = vertical ? 156 : 130
+        fileAndMap.splitViewItems[1].minimumThickness = vertical ? 176 : 130
+        if didSetUpDividers {
+            split.adjustSubviews()
+            let extent = vertical ? split.bounds.width : split.bounds.height
+            split.setPosition(min(290, extent * 0.44), ofDividerAt: 0)
+            split.autosaveName = Settings.layoutName(vertical ? "SideBySide" : "Stacked")
+        }
+    }
+
+    private func controller(_ view: NSView) -> NSViewController {
+        let controller = NSViewController()
+        controller.view = view
+        return controller
+    }
+
+    private func setup(_ window: NSWindow) {
+        let filePane = NSSplitViewItem(viewController: controller(files.scroll))
+        filePane.preferredThicknessFraction = 0.31
+        map.mapAppearance = Settings.mapAppearance
+        let mapPane = NSSplitViewItem(viewController: controller(map))
+        fileAndMap.splitView.isVertical = !Settings.bool("vertical")
+        fileAndMap.addSplitViewItem(filePane)
+        fileAndMap.addSplitViewItem(mapPane)
+        configureFileSplit()
+        panes.splitView.isVertical = true
+        panes.addSplitViewItem(NSSplitViewItem(viewController: fileAndMap))
+        detailPane = NSSplitViewItem(viewController: controller(details.root))
+        detailPane.minimumThickness = 240
+        detailPane.preferredThicknessFraction = 0.28
+        detailPane.canCollapse = true
+        panes.addSplitViewItem(detailPane)
+
+        pathControl.pathStyle = .standard
+        pathControl.url = location
+        pathControl.target = self
+        pathControl.action = #selector(breadcrumb)
+        pathControl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        info.textColor = .secondaryLabelColor
+        info.font = .systemFont(ofSize: 12)
+        info.lineBreakMode = .byTruncatingMiddle
+        info.maximumNumberOfLines = 1
+        info.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        status.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        status.textColor = .secondaryLabelColor
+        status.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        progress.style = .spinning
+        progress.controlSize = .small
+        progress.isDisplayedWhenStopped = false
+        progress.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        progress.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        cancel.bezelStyle = .rounded
+        cancel.controlSize = .small
+        cancel.target = self
+        cancel.action = #selector(cancelScan)
+        cancel.keyEquivalent = "\u{1b}"
+        cancel.keyEquivalentModifierMask = []
+        cancel.isHidden = true
+        issues.bezelStyle = .rounded
+        issues.controlSize = .small
+        issues.target = self
+        issues.action = #selector(showIssues)
+        issues.isHidden = true
+
+        let header = NSStackView(views: [pathControl])
+        header.edgeInsets = NSEdgeInsets(top: 5, left: 14, bottom: 5, right: 14)
+        let space = NSView()
+        space.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let footer = NSStackView(views: [progress, info, space, status, issues, cancel])
+        footer.edgeInsets = NSEdgeInsets(top: 6, left: 14, bottom: 6, right: 14)
+        footer.spacing = 8
+        footer.alignment = .centerY
+        let top = NSBox()
+        top.boxType = .separator
+        let bottom = NSBox()
+        bottom.boxType = .separator
+        let shell = ContentSurface(frame: NSRect(x: 0, y: 0, width: 1190, height: 720))
+        let paneView = panes.view
+        for view in [header, top, paneView, bottom, footer] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            shell.addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            header.leadingAnchor.constraint(equalTo: shell.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: shell.trailingAnchor),
+            header.topAnchor.constraint(equalTo: shell.topAnchor),
+            header.heightAnchor.constraint(equalToConstant: 36),
+            top.leadingAnchor.constraint(equalTo: shell.leadingAnchor),
+            top.trailingAnchor.constraint(equalTo: shell.trailingAnchor),
+            top.topAnchor.constraint(equalTo: header.bottomAnchor),
+            paneView.leadingAnchor.constraint(equalTo: shell.leadingAnchor),
+            paneView.trailingAnchor.constraint(equalTo: shell.trailingAnchor),
+            paneView.topAnchor.constraint(equalTo: top.bottomAnchor),
+            bottom.leadingAnchor.constraint(equalTo: shell.leadingAnchor),
+            bottom.trailingAnchor.constraint(equalTo: shell.trailingAnchor),
+            bottom.topAnchor.constraint(equalTo: paneView.bottomAnchor),
+            footer.leadingAnchor.constraint(equalTo: shell.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: shell.trailingAnchor),
+            footer.topAnchor.constraint(equalTo: bottom.bottomAnchor),
+            footer.bottomAnchor.constraint(equalTo: shell.bottomAnchor),
+            footer.heightAnchor.constraint(equalToConstant: 34)
+        ])
+        let root = controller(shell)
+        root.addChild(panes)
+        window.contentViewController = root
+        window.initialFirstResponder = files.view
+        window.setContentSize(NSSize(width: 1190, height: 720))
+        let toolbar = NSToolbar(identifier: "ScanToolbar")
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = true
+        toolbar.autosavesConfiguration = true
+        window.toolbar = toolbar
+        window.toolbarStyle = .unified
+        window.center()
+        window.setFrameAutosaveName(Settings.layoutName("ScanWindow"))
+
+        map.resized = { [weak self] in self?.renderMap(debounce: true) }
+        map.choose = { [weak self] id, double in
+            self?.select(id)
+            if let self { self.window?.makeFirstResponder(self.files.view) }
+            if double { self?.openItem(id) }
+        }
+        map.zoomAggregate = { [weak self] id in
+            guard let self, id != zoom else { return }
+            zoomTo(id: id)
+        }
+        map.hover = { [weak self] id in self?.showInfo(id ?? self?.selected) }
+        map.context = { [weak self] id in self?.contextMenu(id) }
+        files.didSelect = { [weak self] id in self?.select(id, reveal: false) }
+        files.didOpen = { [weak self] id in self?.openItem(id) }
+        files.menuForRow = { [weak self] id in self?.contextMenu(id) }
+        details.didSelect = { [weak self] id in self?.select(id, fromSearch: true) }
+        details.didOpen = { [weak self] id in self?.openItem(id) }
+        details.menuForRow = { [weak self] id in self?.contextMenu(id) }
+        details.updateSearch = { [weak self] in self?.search() }
+    }
+
+    func scan(restore: Bool = true, refreshing id: Int? = nil, afterTrash: Bool = false) {
+        guard !closed, !isTrashing else { return }
+        let oldSnapshot = snapshot
+        let selectedURL = rescanningSelection ?? selected.flatMap { $0 >= 0 ? oldSnapshot?.url(for: $0) : nil }
+        let zoomURL = oldSnapshot?.url(for: zoom)
+        let oldStack = stack.compactMap { oldSnapshot?.url(for: $0) }
+        rescanningSelection = nil
+        scanWorker?.cancel()
+        whileScanning?.cancel()
+        generation = UUID()
+        let token = generation
+        let started = ContinuousClock.now
+        let location = location
+        let ignoreCreator = ignoreCreator
+        progress.startAnimation(nil)
+        cancel.isEnabled = true
+        cancel.isHidden = afterTrash
+        issues.isHidden = true
+        status.stringValue = afterTrash ? "Updating after move…" : "Scanning…"
+        info.stringValue = location.path
+        map.message = "Scanning \(location.lastPathComponent)…"
+        let (updates, continuation) = AsyncStream.makeStream(of: ScanProgress.self, bufferingPolicy: .bufferingNewest(1))
+        let worker = Task.detached(priority: .userInitiated) {
+            defer { continuation.finish() }
+            let summary: ScanSummary
+            if let id, let oldSnapshot {
+                summary = if afterTrash {
+                    try InventoryScanner.removing(id, from: oldSnapshot)
+                } else {
+                    try InventoryScanner.refresh(id, in: oldSnapshot) { continuation.yield($0) }
+                }
+            } else {
+                summary = try InventoryScanner.scan(location, ignoreCreatorCode: ignoreCreator) { continuation.yield($0) }
+            }
+            return ScanResult(
+                snapshot: summary,
+                zoom: restore ? (zoomURL.flatMap(summary.find) ?? 0) : 0,
+                stack: restore ? oldStack.compactMap(summary.find) : [],
+                selected: restore ? selectedURL.flatMap(summary.find) : nil
+            )
+        }
+        scanWorker = worker
+        whileScanning = Task { [weak self] in
+            for await update in updates {
+                guard let self, !Task.isCancelled, self.generation == token else { return }
+                if worker.isCancelled { continue }
+                let seconds = Int(started.duration(to: .now).components.seconds)
+                let pattern: Duration.TimeFormatStyle.Pattern = seconds >= 3600 ? .hourMinuteSecond : .minuteSecond
+                let elapsed = Duration.seconds(seconds).formatted(.time(pattern: pattern))
+                let phase = update.finishing ? "Calculating totals…" : "Scanning \(location.lastPathComponent)…"
+                if self.map.message != phase { self.map.message = phase }
+                let traversal = update.traversal == .bulk ? "APFS" : "Compatible"
+                self.status.stringValue = "\(update.entries.formatted()) entries · \(elapsed)"
+                self.info.stringValue = "\(traversal) · \(update.path)"
+            }
+            guard let self, !Task.isCancelled, self.generation == token else { return }
+            self.scanWorker = nil
+            self.progress.stopAnimation(nil)
+            self.cancel.isHidden = true
+            defer { self.applyDeferredSettings() }
+            do {
+                let result = try await worker.value
+                self.snapshot = result.snapshot
+                self.zoom = result.zoom
+                self.stack = result.stack
+                self.selected = result.selected
+                self.renderAll(reusePalette: afterTrash)
+            } catch is CancellationError {
+                self.updateStatus()
+                self.map.message = "Scan canceled."
+                if self.snapshot == nil { self.status.stringValue = "Canceled" }
+            } catch {
+                self.updateStatus()
+                self.map.message = "Couldn’t scan this location."
+                self.present(error)
+            }
+        }
+    }
+
+    @objc func cancelScan() {
+        guard !cancel.isHidden, let scanWorker else { return }
+        scanWorker.cancel()
+        cancel.isEnabled = false
+        status.stringValue = "Cancelling…"
+    }
+
+    private func applyDeferredSettings() {
+        guard deferredSettings else { return }
+        deferredSettings = false
+        applySettings()
+    }
+
+    func applySettings() {
+        map.mapAppearance = Settings.mapAppearance
+        files.setCompactText(Settings.bool("smallFont"))
+        let vertical = !Settings.bool("vertical")
+        if fileAndMap.splitView.isVertical != vertical { configureFileSplit() }
+        let newPalette = Settings.treemapPalette
+        let newShareColors = Settings.bool("shareColors", default: true)
+        if palette != newPalette || shareColors != newShareColors {
+            palette = newPalette
+            shareColors = newShareColors
+            if let snapshot, let totals {
+                applyPalette(snapshot: snapshot, totals: totals)
+                details.recolor(colors)
+            }
+        }
+
+        let newOptions = Settings.options
+        let ignore = Settings.bool("ignoreCreator", default: true)
+        guard options != newOptions || ignoreCreator != ignore else { return }
+        if isTrashing {
+            deferredSettings = true
+            return
+        }
+        options = newOptions
+        if let snapshot, !snapshot.isExpandable(zoom, options: options) {
+            zoom = snapshot.lineage(of: zoom).reversed().first { snapshot.isExpandable($0, options: options) } ?? 0
+            stack.removeAll { !snapshot.isExpandable($0, options: options) }
+        }
+        if let snapshot, let id = selected, id >= 0, !options.packages,
+           let package = snapshot.lineage(of: id).first(where: { snapshot.kinds[Int(snapshot.nodes[$0].kind)].isPackage && $0 != 0 }) {
+            selected = package
+        }
+        if ignoreCreator != ignore {
+            ignoreCreator = ignore
+            scan()
+        } else {
+            renderAll()
+        }
+    }
+
+    private func applyPalette(snapshot: ScanSummary, totals: [KindTotal]) {
+        let assignments = shareColors ? KindColors.shared : documentColors
+        colors = assignments.colors(for: snapshot, totals: totals, palette: palette)
+        map.recolor(colors)
+    }
+
+    private func renderAll(reusePalette: Bool = false) {
+        mapWorker?.cancel()
+        mapUpdate?.cancel()
+        mapUpdate = nil
+        totals = nil
+        if !reusePalette { colors = [] }
+        pathControl.url = snapshot?.url(for: zoom) ?? location
+        files.display(snapshot, root: zoom, options: options)
+        files.reveal(selected)
+        searchWorker?.cancel()
+        searchUpdate?.cancel()
+        details.display(snapshot: snapshot, totals: nil, colors: [], options: options)
+        updateStatus()
+        map.clear()
+        map.selection = selected
+        map.message = "Updating treemap…"
+        if reusePalette { renderMap() }
+        renderTotals(reusingPalette: reusePalette)
+    }
+
+    private func renderTotals(reusingPalette: Bool) {
+        totalsWorker?.cancel()
+        totalsUpdate?.cancel()
+        guard let snapshot else { return }
+        let options = options
+        let worker = Task.detached(priority: .userInitiated) { try snapshot.kindTotals(options: options) }
+        totalsWorker = worker
+        totalsUpdate = Task { [weak self] in
+            guard let data = try? await worker.value, let self, !Task.isCancelled else { return }
+            self.totals = data
+            self.applyPalette(snapshot: snapshot, totals: data)
+            self.details.display(snapshot: snapshot, totals: data, colors: self.colors, options: options)
+            self.details.sync(self.selected)
+            if !reusingPalette || self.mapUpdate == nil { self.renderMap() }
+            self.search()
+        }
+    }
+
+    private func renderMap(animate: Bool = false, debounce: Bool = false) {
+        mapWorker?.cancel()
+        mapUpdate?.cancel()
+        mapUpdate = nil
+        guard let snapshot, colors.count == snapshot.kinds.count else { return }
+        let size = map.bounds.size
+        guard size.width > 1, size.height > 1 else { return }
+        let options = options
+        let zoom = zoom
+        mapUpdate = Task { [weak self] in
+            if debounce { try? await Task.sleep(for: .milliseconds(80)) }
+            guard let self, !Task.isCancelled else { return }
+            let worker = Task.detached(priority: .userInitiated) {
+                try TreemapLayout.make(snapshot: snapshot, focus: zoom, size: size, options: options)
+            }
+            self.mapWorker = worker
+            guard let tiles = try? await worker.value, !Task.isCancelled else { return }
+            if tiles.isEmpty { self.map.message = "No items with a size to display." }
+            self.map.show(tiles, snapshot: snapshot, colors: self.colors, size: size, animate: animate && Settings.bool("animate", default: true) && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+        }
+    }
+
+    private func search() {
+        searchWorker?.cancel()
+        searchUpdate?.cancel()
+        guard details.searching, let snapshot else { return }
+        let query = details.query
+        let field = details.field
+        let kind = details.kind
+        let options = options
+        details.searchStarted()
+        searchUpdate = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard let self, !Task.isCancelled else { return }
+            let worker = Task.detached(priority: .userInitiated) {
+                try snapshot.search(query, field: field, kind: kind, options: options)
+            }
+            self.searchWorker = worker
+            guard let matches = try? await worker.value, !Task.isCancelled else { return }
+            self.details.showMatches(matches)
+        }
+    }
+
+    private func updateStatus() {
+        guard let snapshot else {
+            status.stringValue = ""
+            info.stringValue = location.path
+            return
+        }
+        let node = snapshot.nodes[zoom]
+        if !isTrashing, scanWorker == nil {
+            status.stringValue = "\(node.fileCount.formatted()) files   ·   \(formatSize(node.size(options.mode)))"
+        }
+        issues.isHidden = snapshot.issueCount == 0
+        issues.title = "\(snapshot.issueCount.formatted()) skipped"
+        showInfo(selected)
+    }
+
+    private func showInfo(_ id: Int?) {
+        guard !isTrashing, scanWorker == nil, let snapshot else { return }
+        guard let id else {
+            info.stringValue = snapshot.url(for: zoom).path
+            return
+        }
+        if id < 0 {
+            info.stringValue = "\(id == -1 ? "Free Space" : "Other Space")  ·  \(formatSize(snapshot.size(of: id, options: options)))"
+        } else {
+            info.stringValue = "\(formatSize(snapshot.size(of: id, options: options)))  ·  \(snapshot.url(for: id).path)"
+        }
+        info.toolTip = info.stringValue
+    }
+
+    private func select(_ id: Int?, reveal: Bool = true, fromSearch: Bool = false) {
+        guard let snapshot else { return }
+        if let id, id >= 0, fromSearch, !snapshot.lineage(of: id).contains(zoom) {
+            zoomTo(id: Int(snapshot.nodes[id].parent), selectAfter: id)
+            return
+        }
+        selected = id
+        map.selection = id
+        if reveal { files.reveal(id) }
+        if !fromSearch { details.sync(id) }
+        showInfo(id)
+        if let id, id >= 0, Settings.bool("syncFinder") { revealInFinder() }
+    }
+
+    private func zoomTo(id: Int, selectAfter: Int? = nil, record: Bool = true) {
+        guard let snapshot, id >= 0, snapshot.isExpandable(id, options: options) else { return }
+        if record, id != zoom { stack.append(zoom) }
+        if zoom != id { map.acceptsTileActions = false }
+        zoom = id
+        selected = selectAfter ?? id
+        pathControl.url = snapshot.url(for: id)
+        files.display(snapshot, root: id, options: options)
+        files.reveal(selected)
+        map.selection = selected
+        details.sync(selected)
+        renderMap(animate: true)
+        updateStatus()
+    }
+
+    @objc private func breadcrumb() {
+        guard let clicked = pathControl.clickedPathItem?.url, let id = snapshot?.find(clicked) else { return }
+        zoomTo(id: id)
+    }
+
+    @objc func zoomIn() {
+        guard let snapshot, let selected, selected >= 0 else { return }
+        let id = snapshot.isExpandable(selected, options: options) ? selected : Int(snapshot.nodes[selected].parent)
+        zoomTo(id: id, selectAfter: id == selected ? nil : selected)
+    }
+
+    @objc func zoomOut() {
+        guard let snapshot, zoom != 0 else { return }
+        let old = zoom
+        let previous = stack.popLast() ?? Int(snapshot.nodes[zoom].parent)
+        let selectAfter = snapshot.lineage(of: old).contains(previous) ? old : nil
+        zoomTo(id: previous, selectAfter: selectAfter, record: false)
+    }
+
+    @objc func zoomRoot() {
+        stack = []
+        zoomTo(id: 0, record: false)
+    }
+
+    private func openItem(_ id: Int) {
+        guard let snapshot, id >= 0 else { return }
+        if snapshot.isExpandable(id, options: options) { zoomTo(id: id) }
+        else { NSWorkspace.shared.open(snapshot.url(for: id)) }
+    }
+
+    @objc func openSelected() {
+        if let url = selectedURL { NSWorkspace.shared.open(url) }
+    }
+
+    @objc func revealInFinder() {
+        if let url = selectedURL { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+    }
+
+    private var selectedURL: URL? {
+        guard let selected, selected >= 0 else { return nil }
+        return snapshot?.url(for: selected)
+    }
+
+    @objc func refreshSelection() {
+        guard let selected, selected >= 0 else { return }
+        rescanningSelection = selectedURL
+        scan(refreshing: selected)
+    }
+
+    @objc func refreshAll() { scan() }
+
+    @objc func findFiles() {
+        detailPane.isCollapsed = false
+        details.openSearch(focus: true)
+    }
+
+    @objc func findNext() {
+        guard details.hasMatches else { return }
+        detailPane.isCollapsed = false
+        details.next()
+    }
+    @objc func scrollToSelection() { files.reveal(selected) }
+
+    @objc func toggleList() {
+        detailPane.isCollapsed = false
+        details.toggleList()
+    }
+
+    @objc func toggleDetails() { detailPane.animator().isCollapsed.toggle() }
+
+    @objc func copy(_ sender: Any?) { copySelection() }
+
+    @objc func copySelection() {
+        guard let url = selectedURL else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([url as NSURL])
+    }
+
+    @objc func copyPath() {
+        guard let url = selectedURL else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.path, forType: .string)
+    }
+
+    @objc func findSelection() {
+        guard let snapshot, let selected, selected >= 0 else { return }
+        detailPane.isCollapsed = false
+        details.showList(query: snapshot.nodes[selected].name, focus: true)
+    }
+
+    @objc func inspect() {
+        guard let snapshot, let selected, selected >= 0, let window else { return }
+        let item = snapshot.nodes[selected]
+        let url = snapshot.url(for: selected)
+        let attrs = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
+        let alert = NSAlert()
+        alert.messageText = item.name
+        let created = attrs?.creationDate?.formatted(date: .abbreviated, time: .shortened) ?? "—"
+        let modified = attrs?.contentModificationDate?.formatted(date: .abbreviated, time: .shortened) ?? "—"
+        alert.informativeText = """
+        \(url.path)
+
+        Kind: \(snapshot.kinds[Int(item.kind)].title)
+        Allocated: \(formatSize(item.allocated)) (\(item.allocated.formatted()) bytes)
+        Logical: \(formatSize(item.logical)) (\(item.logical.formatted()) bytes)
+        Files: \(item.fileCount.formatted())
+        Created: \(created)
+        Modified: \(modified)
+        """
+        alert.icon = NSWorkspace.shared.icon(forFile: url.path)
+        alert.addButton(withTitle: "Done")
+        alert.beginSheetModal(for: window)
+    }
+
+    @objc func showIssues() {
+        guard let snapshot, let window else { return }
+        let alert = NSAlert()
+        alert.messageText = "\(snapshot.issueCount.formatted()) entries couldn’t be scanned"
+        alert.informativeText = "The treemap and totals reflect the items macOS allowed this app to read."
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 565, height: 180))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let text = NSTextView(frame: scroll.bounds)
+        text.isEditable = false
+        text.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        text.string = snapshot.issues.map { "\($0.path)\n\($0.message)" }.joined(separator: "\n\n")
+        scroll.documentView = text
+        alert.accessoryView = scroll
+        alert.addButton(withTitle: "Done")
+        alert.beginSheetModal(for: window)
+    }
+
+    @objc func moveToTrash() {
+        guard let snapshot, let id = selected, id > 0, let window, !isTrashing, scanWorker == nil else { return }
+        let node = snapshot.nodes[id]
+        let url = snapshot.url(for: id)
+        let parent = snapshot.url(for: Int(node.parent))
+        if !Settings.bool("confirmTrash", default: true) {
+            trash(url, parent: parent, node: node, id: id)
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Move “\(node.name)” to Trash?"
+        alert.informativeText = url.path
+        alert.addButton(withTitle: "Move to Trash").hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel").keyEquivalent = "\u{1b}"
+        alert.beginSheetModal(for: window) { [weak self] response in
+            if response == .alertFirstButtonReturn { self?.trash(url, parent: parent, node: node, id: id) }
+        }
+    }
+
+    @discardableResult
+    private func trash(_ url: URL, parent: URL, node: FileNode, id: Int) -> Task<URL?, Error>? {
+        guard !closed, !isTrashing, scanWorker == nil else { return nil }
+        guard let snapshot, snapshot.nodes.indices.contains(id),
+              snapshot.nodes[id].inode == node.inode, snapshot.nodes[id].device == node.device,
+              snapshot.url(for: id).path == url.path else {
+            present(CocoaError(.fileNoSuchFile, userInfo: [NSLocalizedDescriptionKey: "The scan changed. Select the item again."]))
+            return nil
+        }
+        isTrashing = true
+        status.stringValue = "Moving to Trash…"
+        info.stringValue = url.path
+        progress.startAnimation(nil)
+        window?.toolbar?.validateVisibleItems()
+
+        let worker = Task.detached(priority: .userInitiated) {
+            var data = stat()
+            let status = url.withUnsafeFileSystemRepresentation { path in
+                path.map { lstat($0, &data) } ?? -1
+            }
+            guard status == 0, data.st_dev == node.device, data.st_ino == node.inode,
+                  parent.resolvingSymlinksInPath().pathComponents == parent.pathComponents else {
+                throw CocoaError(.fileNoSuchFile, userInfo: [NSLocalizedDescriptionKey: "This item changed since the scan. Refresh before moving it to Trash."])
+            }
+            var resultingURL: NSURL?
+            try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
+            return resultingURL as URL?
+        }
+        Task { [weak self] in
+            let result = await worker.result
+            guard let self, !closed else { return }
+            isTrashing = false
+            window?.toolbar?.validateVisibleItems()
+            switch result {
+            case .success:
+                rescanningSelection = parent
+                scan(refreshing: id, afterTrash: true)
+            case let .failure(error):
+                progress.stopAnimation(nil)
+                updateStatus()
+                present(error)
+                applyDeferredSettings()
+            }
+        }
+        return worker
+    }
+
+    private func present(_ error: any Error) {
+        if let window { NSAlert(error: error).beginSheetModal(for: window) }
+    }
+
+    private func contextMenu(_ id: Int) -> NSMenu? {
+        guard id >= 0 else { return nil }
+        select(id)
+        let menu = NSMenu()
+        let actions: [(String, Selector)] = [
+            ("Open", #selector(openSelected)), ("Reveal in Finder", #selector(revealInFinder)),
+            ("Get Info", #selector(inspect)), ("Copy Path", #selector(copyPath)), ("Refresh", #selector(refreshSelection)),
+            ("Zoom In", #selector(zoomIn)), ("Zoom Out", #selector(zoomOut)), ("Move to Trash…", #selector(moveToTrash))
+        ]
+        for (title, action) in actions {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    func captureContent(to url: URL) {
+        guard let view = window?.contentView else { return }
+        view.layoutSubtreeIfNeeded()
+        view.displayIfNeeded()
+        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+        view.cacheDisplay(in: view.bounds, to: rep)
+        try? rep.representation(using: .png, properties: [:])?.write(to: url, options: .atomic)
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        menuItem.action.map(canPerformAction) ?? false
+    }
+
+    func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
+        item.action.map(canPerformAction) ?? false
+    }
+
+    private func canPerformAction(_ action: Selector) -> Bool {
+        switch action {
+        case #selector(zoomOut), #selector(zoomRoot): return zoom != 0
+        case #selector(zoomIn), #selector(openSelected), #selector(revealInFinder),
+             #selector(inspect), #selector(copyPath), #selector(copySelection), #selector(copy(_:)), #selector(findSelection):
+            return selectedURL != nil
+        case #selector(refreshSelection): return selectedURL != nil && scanWorker == nil && !isTrashing
+        case #selector(refreshAll): return scanWorker == nil && !isTrashing
+        case #selector(moveToTrash): return (selected ?? 0) > 0 && scanWorker == nil && !isTrashing
+        case #selector(findFiles), #selector(toggleList): return snapshot != nil
+        case #selector(findNext): return details.hasMatches
+        case #selector(scrollToSelection): return selected != nil
+        default: return true
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        closed = true
+        files.cancelSorting()
+        scanWorker?.cancel()
+        whileScanning?.cancel()
+        mapWorker?.cancel()
+        mapUpdate?.cancel()
+        totalsWorker?.cancel()
+        totalsUpdate?.cancel()
+        searchWorker?.cancel()
+        searchUpdate?.cancel()
+        onClose?(self)
+    }
+
+    private static let toolbarItems: [(String, String, String, Selector)] = [
+        ("zoomOut", "Zoom Out", "minus.magnifyingglass", #selector(zoomOut)),
+        ("zoomIn", "Zoom In", "plus.magnifyingglass", #selector(zoomIn)),
+        ("refresh", "Rescan", "arrow.clockwise", #selector(refreshAll)),
+        ("reveal", "Reveal in Finder", "folder", #selector(revealInFinder)),
+        ("info", "Get Info", "info.circle", #selector(inspect)),
+        ("search", "Find", "magnifyingglass", #selector(findFiles)),
+        ("details", "Toggle Inspector", "sidebar.right", #selector(toggleDetails)),
+        ("trash", "Move to Trash", "trash", #selector(moveToTrash))
+    ]
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        Self.toolbarItems.map { .init($0.0) } + [.flexibleSpace, .space]
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        ["zoomOut", "zoomIn", "refresh", "reveal", "info"].map { .init($0) } + [.flexibleSpace, .init("search"), .init("details")]
+    }
+
+    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        guard let definition = Self.toolbarItems.first(where: { $0.0 == id.rawValue }) else { return nil }
+        let item = NSToolbarItem(itemIdentifier: id)
+        item.label = definition.1
+        item.paletteLabel = definition.1
+        item.toolTip = definition.1
+        item.image = NSImage(systemSymbolName: definition.2, accessibilityDescription: definition.1)
+        item.target = self
+        item.action = definition.3
+        return item
+    }
+}
+
+@MainActor private final class ContentSurface: NSView {
+    override var isOpaque: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.windowBackgroundColor.setFill()
+        dirtyRect.fill()
+    }
+}
