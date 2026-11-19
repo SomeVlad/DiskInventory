@@ -96,6 +96,8 @@ struct VolumePicker: View {
     private var settingsObserver: (any NSObjectProtocol)?
     private var volumeObservers: [any NSObjectProtocol] = []
     private var refreshTimer: Timer?
+    private var adviceObservers: [any NSObjectProtocol] = []
+    var launchCleanup = CommandLine.arguments.contains("--cleanup")
     var testLocation: URL?
     var testTrash = false
     var testLayout = false
@@ -126,6 +128,14 @@ struct VolumePicker: View {
             volumeObservers.append(observer)
         }
 
+        let center = DistributedNotificationCenter.default()
+        adviceObservers.append(center.addObserver(forName: .init(AdviceStore.changedNotification), object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.documents.forEach { $0.reloadAdvice() } }
+        })
+        adviceObservers.append(center.addObserver(forName: .init(AdviceStore.showNotification), object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.showCleanup() }
+        })
+
         if testTrash {
             runTrashSmokeTest()
         } else if let testLocation {
@@ -136,9 +146,26 @@ struct VolumePicker: View {
             } else {
                 runSmokeTest(testLocation)
             }
+        } else if launchCleanup {
+            showCleanup()
         } else if documents.isEmpty {
             scanVolumes()
         }
+    }
+
+    @objc func showCleanup() {
+        NSApp.activate()
+        if let document = documents.last(where: { $0.canShowScan }) {
+            if document.window?.isMiniaturized == true { document.window?.deminiaturize(nil) }
+            document.window?.makeKeyAndOrderFront(nil)
+            document.cleanUp()
+        } else {
+            open(FileManager.default.homeDirectoryForCurrentUser).cleanUp()
+        }
+    }
+
+    @objc func scanHome() {
+        open(FileManager.default.homeDirectoryForCurrentUser)
     }
 
     private func scheduleSettingsUpdate() {

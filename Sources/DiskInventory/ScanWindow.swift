@@ -1,12 +1,14 @@
 import AppKit
 import Darwin
 import InventoryCore
+import Quartz
+import SwiftUI
 
 @MainActor func formatSize(_ size: Int64) -> String {
     size.formatted(.byteCount(style: .file, spellsOutZero: false, includesActualByteCount: false))
 }
 
-@MainActor final class ScanWindow: NSWindowController, NSWindowDelegate, NSToolbarDelegate, NSMenuItemValidation, NSToolbarItemValidation {
+@MainActor final class ScanWindow: NSWindowController, NSWindowDelegate, NSToolbarDelegate, NSMenuItemValidation, NSToolbarItemValidation, @preconcurrency QLPreviewPanelDataSource {
     private struct ScanResult: Sendable {
         let snapshot: ScanSummary
         let zoom: Int
@@ -50,7 +52,14 @@ import InventoryCore
     private let issues = NSButton(title: "Scan Issues", target: nil, action: nil)
     private var rescanningSelection: URL?
     private var isTrashing = false
-    private var cleanup: CleanupWindowController?
+    private var cleanupModel: CleanupModel?
+    private var cleanupNeedsUpdate = false
+    private var previewOverride: URL?
+    private var placeholderAction: (() -> Void)?
+    private var displayName: String {
+        location.path == "/System/Volumes/Data" ? Self.bootVolumeName : location.lastPathComponent
+    }
+    static let bootVolumeName = (try? URL(filePath: "/").resourceValues(forKeys: [.volumeLocalizedNameKey]).volumeLocalizedName) ?? "Macintosh HD"
     private var deferredSettings = false
     private var closed = false
     var onClose: ((ScanWindow) -> Void)?
@@ -386,9 +395,11 @@ import InventoryCore
         map.resized = { [weak self] in self?.renderMap(debounce: true) }
         map.choose = { [weak self] id, double in
             self?.select(id)
-            if let self { self.window?.makeFirstResponder(self.files.view) }
             if double { self?.openItem(id) }
         }
+        map.quickLook = { [weak self] in self?.toggleQuickLook() }
+        map.zoomOutRequest = { [weak self] in self?.zoomOut() }
+        map.placeholderAction = { [weak self] in self?.placeholderAction?() }
         map.zoomAggregate = { [weak self] id in
             guard let self, id != zoom else { return }
             zoomTo(id: id)
@@ -402,6 +413,65 @@ import InventoryCore
         details.didOpen = { [weak self] id in self?.openItem(id) }
         details.menuForRow = { [weak self] id in self?.contextMenu(id) }
         details.updateSearch = { [weak self] in self?.search() }
+        details.tabChanged = { [weak self] in self?.tabChanged() }
+        details.kindSelected = { [weak self] _ in self?.updateMapEmphasis() }
+    }
+
+    private func tabChanged() {
+        if details.cleaning { prepareCleanup() }
+        updateMapEmphasis()
+    }
+
+    private func prepareCleanup() {
+        guard let snapshot else { return }
+        if let cleanupModel {
+            if cleanupNeedsUpdate || !cleanupModel.analyzed {
+                cleanupNeedsUpdate = false
+                cleanupModel.update(snapshot: snapshot)
+            }
+            return
+        }
+        let model = CleanupModel(snapshot: snapshot) { [weak self] removed, refreshed in
+            await self?.applyCleanup(removed: removed, refreshed: refreshed)
+        }
+        model.reveal = { [weak self] path in self?.revealPath(path) }
+        model.quickLook = { [weak self] path in self?.preview(path) }
+        model.candidatesChanged = { [weak self] in self?.updateMapEmphasis() }
+        model.scanHome = { NSApp.sendAction(#selector(ApplicationController.scanHome), to: nil, from: nil) }
+        cleanupModel = model
+        details.showCleanup(AnyView(CleanupPanel(model: model)))
+        Task { await model.analyze() }
+    }
+
+    func reloadAdvice() {
+        cleanupModel?.reloadAdvice()
+    }
+
+    private func updateMapEmphasis() {
+        if details.cleaning, let cleanupModel {
+            map.highlightKind = nil
+            map.highlightNodes = cleanupModel.candidateIDs
+        } else if details.searching, details.hasMatches, !details.query.isEmpty || details.kind != nil {
+            map.highlightKind = nil
+            map.highlightNodes = Set(details.matchIDs)
+        } else if let kind = details.selectedKind {
+            map.highlightNodes = nil
+            map.highlightKind = Int32(kind)
+        } else {
+            map.highlightKind = nil
+            map.highlightNodes = nil
+        }
+    }
+
+    private func revealPath(_ path: String) {
+        guard let snapshot, let id = snapshot.locate(path) else { return }
+        select(id, fromSearch: true)
+    }
+
+    private func preview(_ path: String) {
+        previewOverride = URL(filePath: path)
+        guard let panel = QLPreviewPanel.shared() else { return }
+        if panel.isVisible { panel.reloadData() } else { panel.makeKeyAndOrderFront(nil) }
     }
 
     func scan(restore: Bool = true, refreshing id: Int? = nil, afterTrash: Bool = false) {
@@ -424,7 +494,7 @@ import InventoryCore
         issues.isHidden = true
         status.stringValue = afterTrash ? "Updating after move…" : "Scanning…"
         info.stringValue = location.path
-        map.message = "Scanning \(location.lastPathComponent)…"
+        map.placeholder = MapPlaceholder(title: "Scanning \(displayName)", symbol: "magnifyingglass", busy: true)
         let (updates, continuation) = AsyncStream.makeStream(of: ScanProgress.self, bufferingPolicy: .bufferingNewest(1))
         let worker = Task.detached(priority: .userInitiated) {
             defer { continuation.finish() }
@@ -453,8 +523,9 @@ import InventoryCore
                 let seconds = Int(started.duration(to: .now).components.seconds)
                 let pattern: Duration.TimeFormatStyle.Pattern = seconds >= 3600 ? .hourMinuteSecond : .minuteSecond
                 let elapsed = Duration.seconds(seconds).formatted(.time(pattern: pattern))
-                let phase = update.finishing ? "Calculating totals…" : "Scanning \(location.lastPathComponent)…"
-                if self.map.message != phase { self.map.message = phase }
+                self.map.placeholder = MapPlaceholder(
+                    title: update.finishing ? "Calculating Totals" : "Scanning \(self.displayName)", symbol: "magnifyingglass",
+                    detail: "\(update.entries.formatted()) items · \(elapsed)", busy: true)
                 let traversal = update.traversal == .bulk ? "APFS" : "Compatible"
                 self.status.stringValue = "\(update.entries.formatted()) entries · \(elapsed)"
                 self.info.stringValue = "\(traversal) · \(update.path)"
@@ -471,16 +542,53 @@ import InventoryCore
                 self.stack = result.stack
                 self.selected = result.selected
                 self.renderAll(reusePalette: afterTrash)
+                if self.details.cleaning, let snapshot = self.snapshot { self.cleanupModel?.update(snapshot: snapshot) } else { self.cleanupNeedsUpdate = true }
             } catch is CancellationError {
                 self.updateStatus()
-                self.map.message = "Scan canceled."
+                self.showPlaceholder(MapPlaceholder(title: "Scan Canceled", symbol: "xmark.circle", action: "Scan Again")) { [weak self] in self?.scan() }
                 if self.snapshot == nil { self.status.stringValue = "Canceled" }
             } catch {
                 self.updateStatus()
-                self.map.message = "Couldn’t scan this location."
-                self.present(error)
+                self.showPlaceholder(MapPlaceholder(
+                    title: "Couldn’t Scan This Location", symbol: "exclamationmark.triangle",
+                    detail: error.localizedDescription, action: "Choose Another Folder")) {
+                    NSApp.sendAction(#selector(ApplicationController.chooseFolder), to: nil, from: nil)
+                }
             }
         }
+    }
+
+    private func showPlaceholder(_ placeholder: MapPlaceholder, action: @escaping () -> Void) {
+        placeholderAction = action
+        map.placeholder = placeholder
+    }
+
+    @objc func quickLook(_ sender: Any?) { toggleQuickLook() }
+
+    private func toggleQuickLook() {
+        previewOverride = nil
+        guard selectedURL != nil, let panel = QLPreviewPanel.shared() else { return }
+        if QLPreviewPanel.sharedPreviewPanelExists(), panel.isVisible {
+            panel.orderOut(nil)
+        } else {
+            panel.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool { true }
+
+    override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        panel.dataSource = self
+    }
+
+    override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        panel.dataSource = nil
+    }
+
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { (previewOverride ?? selectedURL) == nil ? 0 : 1 }
+
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> (any QLPreviewItem)! {
+        (previewOverride ?? selectedURL) as NSURL?
     }
 
     @objc func cancelScan() {
@@ -557,7 +665,7 @@ import InventoryCore
         updateStatus()
         map.clear()
         map.selection = selected
-        map.message = "Updating treemap…"
+        map.placeholder = MapPlaceholder(title: "Drawing Treemap", symbol: "square.grid.3x3", busy: true)
         if reusePalette { renderMap() }
         renderTotals(reusingPalette: reusePalette)
     }
@@ -597,8 +705,11 @@ import InventoryCore
             }
             self.mapWorker = worker
             guard let tiles = try? await worker.value, !Task.isCancelled else { return }
-            if tiles.isEmpty { self.map.message = "No items with a size to display." }
-            self.map.show(tiles, snapshot: snapshot, colors: self.colors, size: size, animate: animate && Settings.bool("animate", default: true) && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+            if tiles.isEmpty {
+                self.map.placeholder = MapPlaceholder(title: "Nothing to Show", symbol: "square.dashed", detail: "No items in this folder take up space")
+            }
+            self.map.show(tiles, snapshot: snapshot, colors: self.colors, size: size, options: options,
+                          animate: animate && Settings.bool("animate", default: true) && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
         }
     }
 
@@ -663,6 +774,9 @@ import InventoryCore
         if reveal { files.reveal(id) }
         if !fromSearch { details.sync(id) }
         showInfo(id)
+        if previewOverride == nil, QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
+            QLPreviewPanel.shared().reloadData()
+        }
         if let id, id >= 0, Settings.bool("syncFinder") { revealInFinder() }
     }
 
@@ -833,16 +947,8 @@ import InventoryCore
     }
 
     @objc func cleanUp() {
-        guard let snapshot, scanWorker == nil, !isTrashing else { return }
-        if let window = cleanup?.window, window.isVisible {
-            window.makeKeyAndOrderFront(nil)
-            return
-        }
-        let controller = CleanupWindowController(snapshot: snapshot, title: location.lastPathComponent) { [weak self] removed, refreshed in
-            await self?.applyCleanup(removed: removed, refreshed: refreshed)
-        }
-        cleanup = controller
-        controller.showWindow(nil)
+        detailPane.isCollapsed = false
+        details.selectTab(2)
     }
 
     private func applyCleanup(removed: [URL], refreshed: [URL]) async -> ScanSummary? {
@@ -978,7 +1084,7 @@ import InventoryCore
         case #selector(refreshSelection): return selectedURL != nil && scanWorker == nil && !isTrashing
         case #selector(refreshAll): return scanWorker == nil && !isTrashing
         case #selector(moveToTrash): return (selected ?? 0) > 0 && scanWorker == nil && !isTrashing
-        case #selector(cleanUp): return snapshot != nil && scanWorker == nil && !isTrashing
+        case #selector(cleanUp): return snapshot != nil
         case #selector(findFiles), #selector(toggleList): return snapshot != nil
         case #selector(findNext): return details.hasMatches
         case #selector(scrollToSelection): return selected != nil
@@ -988,7 +1094,6 @@ import InventoryCore
 
     func windowWillClose(_ notification: Notification) {
         closed = true
-        cleanup?.close()
         files.cancelSorting()
         scanWorker?.cancel()
         whileScanning?.cancel()

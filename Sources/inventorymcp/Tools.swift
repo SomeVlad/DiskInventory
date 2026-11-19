@@ -202,6 +202,55 @@ private let formatterISO: ISO8601DateFormatter = {
     return formatter
 }()
 
+
+func adviceSize(_ path: String, store: ScanStore) -> Int64 {
+    for scan in store.all {
+        if let id = scan.snapshot.locate(path) { return scan.snapshot.nodes[id].allocated }
+    }
+    var info = stat()
+    guard lstat(path, &info) == 0 else { return 0 }
+    guard info.st_mode & S_IFMT == S_IFDIR else { return Int64(info.st_blocks) * 512 }
+    return (try? InventoryScanner.scan(URL(filePath: path, directoryHint: .isDirectory)).nodes[0].allocated) ?? 0
+}
+
+func adviceJSON(_ sheet: AdviceSheet?) -> [String: Any] {
+    guard let sheet else { return ["advice": NSNull()] }
+    let pending = sheet.items.filter { $0.status == .pending }
+    return [
+        "title": sheet.title,
+        "summary": sheet.summary,
+        "updated_at": sheet.updatedAt,
+        "pending_size_h": human(pending.reduce(0) { $0 + $1.size }),
+        "items": sheet.items.map { item in
+            [
+                "id": item.id.uuidString,
+                "path": item.path,
+                "size": item.size,
+                "size_h": human(item.size),
+                "verdict": item.verdict.rawValue,
+                "reason": item.reason,
+                "status": item.status.rawValue,
+                "status_at": item.statusAt as Any,
+            ] as [String: Any]
+        },
+    ]
+}
+
+func showCleanupInApp() -> String {
+    AdviceStore.post(AdviceStore.showNotification)
+    let executable = URL(filePath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+    let bundle = executable.deletingLastPathComponent().appending(path: "Disk Inventory.app", directoryHint: .isDirectory)
+    let process = Process()
+    process.executableURL = URL(filePath: "/usr/bin/open")
+    process.arguments = FileManager.default.fileExists(atPath: bundle.path)
+        ? ["-a", bundle.path, "--args", "--cleanup"] : ["-b", "local.diskinventory.app", "--args", "--cleanup"]
+    try? process.run()
+    process.waitUntilExit()
+    return FileManager.default.fileExists(atPath: bundle.path) ? bundle.path : "local.diskinventory.app"
+}
+
+private let verdictDescription = "safe: apps recreate it on their own; regenerable: rebuilt or downloaded again on demand; review: probably unneeded but the user should look; keep: explain why it must stay"
+
 func makeTools(_ store: ScanStore) -> [Tool] {
     [
         syncTool(
@@ -420,6 +469,110 @@ func makeTools(_ store: ScanStore) -> [Tool] {
                     ]
                 },
             ]
+        },
+
+        syncTool(
+            "inventory_advise",
+            "Send your cleanup analysis to the Disk Inventory app: each item appears in the Clean Up tab with its size, your verdict and your reason, and the user decides there. Nothing is deleted by this tool. Paths outside the home folder and known cache areas, and whole top-level folders such as ~/Library or ~/Documents, are refused for any verdict except keep. Opens the app on the Clean Up tab unless show is false.",
+            Schema.object([
+                "title": Schema.text("heading shown above your advice, e.g. what the user asked"),
+                "summary": Schema.text("two or three sentences: what fills the disk and what is safe to remove"),
+                "items": [
+                    "type": "array",
+                    "description": "one entry per file or folder",
+                    "items": [
+                        "type": "object",
+                        "properties": [
+                            "path": Schema.text("absolute path or ~/…"),
+                            "verdict": Schema.choice(verdictDescription, AdviceVerdict.allCases.map(\.rawValue)),
+                            "reason": Schema.text("why, in the user's language: what it is, what happens after removal, how to get it back"),
+                        ],
+                        "required": ["path", "verdict", "reason"],
+                        "additionalProperties": false,
+                    ],
+                ],
+                "append": Schema.boolean("add to the advice already shown instead of replacing it"),
+                "show": Schema.boolean("bring the app forward on the Clean Up tab (default true)"),
+            ], required: ["items"])
+        ) { params in
+            let raw = params.raw["items"] as? [[String: Any]] ?? []
+            guard !raw.isEmpty else { throw ToolFailure("items is required") }
+            var accepted: [AdviceItem] = []
+            var refused: [[String: Any]] = []
+            for entry in raw {
+                guard let given = entry["path"] as? String,
+                      let verdict = (entry["verdict"] as? String).flatMap(AdviceVerdict.init(rawValue:)) else {
+                    refused.append(["item": String(describing: entry), "why": "path and a valid verdict are required"])
+                    continue
+                }
+                let path = AdviceGuard.normalize(given)
+                if let refusal = AdviceGuard.refusal(for: path, verdict: verdict) {
+                    refused.append(["path": path, "why": "\(path) \(refusal)"])
+                    continue
+                }
+                accepted.append(AdviceItem(path: path, size: adviceSize(path, store: store), verdict: verdict,
+                                           reason: (entry["reason"] as? String) ?? ""))
+            }
+            let append = try params.flag("append", fallback: false)
+            let sheet = try AdviceStore.update { sheet in
+                var items = append ? sheet?.items ?? [] : []
+                let known = Set(items.map(\.path))
+                items += accepted.filter { !known.contains($0.path) }
+                sheet = AdviceSheet(
+                    title: params.string("title") ?? sheet?.title ?? "Cleanup advice",
+                    summary: params.string("summary") ?? (append ? sheet?.summary ?? "" : ""),
+                    author: "Claude", items: items)
+            }
+            let opened = try params.flag("show", fallback: true) ? showCleanupInApp() : nil
+            return [
+                "accepted": accepted.count,
+                "accepted_size_h": human(accepted.reduce(0) { $0 + $1.size }),
+                "refused": refused,
+                "opened": opened as Any,
+                "advice": adviceJSON(sheet),
+            ]
+        },
+
+        syncTool(
+            "inventory_advice",
+            "The advice currently shown in the app and what the user did with each item: pending, trashed (moved to the Trash from the app), kept (the user chose to keep it) or missing (gone from disk).",
+            Schema.object([:])
+        ) { _ in
+            let sheet = try AdviceStore.update { sheet in
+                guard var current = sheet else { return }
+                for index in current.items.indices where current.items[index].status == .pending
+                    && !FileManager.default.fileExists(atPath: current.items[index].path) {
+                    current.items[index].status = .missing
+                    current.items[index].statusAt = .now
+                }
+                sheet = current
+            }
+            return adviceJSON(sheet)
+        },
+
+        syncTool(
+            "inventory_advice_clear",
+            "Remove the advice from the app: everything, or only items the user already handled.",
+            Schema.object(["handled_only": Schema.boolean("keep pending items and drop trashed, kept and missing ones")])
+        ) { params in
+            let handledOnly = try params.flag("handled_only", fallback: false)
+            let sheet = try AdviceStore.update { sheet in
+                guard handledOnly, var current = sheet else {
+                    sheet = nil
+                    return
+                }
+                current.items.removeAll { $0.status != .pending }
+                sheet = current.items.isEmpty ? nil : current
+            }
+            return adviceJSON(sheet)
+        },
+
+        syncTool(
+            "inventory_show_cleanup",
+            "Bring Disk Inventory forward on the Clean Up tab, launching it if needed.",
+            Schema.object([:])
+        ) { _ in
+            ["opened": showCleanupInApp()]
         },
     ]
 }

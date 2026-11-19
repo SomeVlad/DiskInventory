@@ -4,7 +4,7 @@ import InventoryCore
 
 @MainActor final class Details: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSMenuDelegate {
     let root = NSView()
-    let tabs = NSSegmentedControl(labels: ["Kinds", "Selection List"], trackingMode: .selectOne, target: nil, action: nil)
+    let tabs = NSSegmentedControl(labels: ["Kinds", "Largest Files", "Clean Up"], trackingMode: .selectOne, target: nil, action: nil)
     let search = NSSearchField()
     let fields = NSPopUpButton()
     let filter = NSPopUpButton()
@@ -13,6 +13,8 @@ import InventoryCore
     var table: NSTableView { searching ? resultsTable : kindsTable }
     let count = NSTextField(labelWithString: "")
     var updateSearch: (() -> Void)?
+    var tabChanged: (() -> Void)?
+    var kindSelected: ((Int?) -> Void)?
     var didSelect: ((Int) -> Void)?
     var didOpen: ((Int) -> Void)?
     var menuForRow: ((Int) -> NSMenu?)?
@@ -20,6 +22,10 @@ import InventoryCore
     private let resultsScroll = NSScrollView()
     private let searchBar = NSStackView()
     private let usageView = NSHostingView(rootView: AnyView(EmptyView()))
+    private let cleanupHost = NSHostingView(rootView: AnyView(EmptyView()))
+    private let noResults = NSHostingView(rootView: ContentUnavailableView("No Results", systemImage: "magnifyingglass", description: Text("Try another name, kind or folder")))
+    private let tableArea = NSView()
+    private var searched = false
     private var snapshot: ScanSummary?
     private var totals: [KindTotal] = []
     private var shownTotals: [KindTotal] = []
@@ -32,8 +38,14 @@ import InventoryCore
     private var filterKinds: [Int] = []
     private var filterIdentifier: String?
     var hasMatches: Bool { searching && !matches.isEmpty }
+    var matchIDs: [Int] { matches }
 
     var searching: Bool { tabs.selectedSegment == 1 }
+    var cleaning: Bool { tabs.selectedSegment == 2 }
+    var selectedKind: Int? {
+        guard !searching, !cleaning, shownTotals.indices.contains(kindsTable.selectedRow) else { return nil }
+        return shownTotals[kindsTable.selectedRow].kind
+    }
     var query: String { search.stringValue }
     var field: SearchField { SearchField(rawValue: fields.titleOfSelectedItem ?? "") ?? .all }
     var kind: Int? {
@@ -73,8 +85,7 @@ import InventoryCore
         count.font = .systemFont(ofSize: 11)
         configureColumns(kindsTable, in: kindsScroll, results: false)
         configureColumns(resultsTable, in: resultsScroll, results: true)
-        let tableArea = NSView()
-        for scroll in [kindsScroll, resultsScroll] {
+        for scroll in [kindsScroll, resultsScroll, noResults] {
             scroll.translatesAutoresizingMaskIntoConstraints = false
             tableArea.addSubview(scroll)
             NSLayoutConstraint.activate([
@@ -85,20 +96,30 @@ import InventoryCore
             ])
         }
         resultsScroll.isHidden = true
+        noResults.isHidden = true
         let stack = NSStackView(views: [tabs, usageView, searchBar, tableArea, count])
         usageView.isHidden = true
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
-        stack.edgeInsets = NSEdgeInsets(top: 10, left: 9, bottom: 9, right: 9)
+        stack.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
         stack.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(stack)
+        cleanupHost.translatesAutoresizingMaskIntoConstraints = false
+        cleanupHost.isHidden = true
+        root.addSubview(cleanupHost)
+        NSLayoutConstraint.activate([
+            cleanupHost.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            cleanupHost.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            cleanupHost.topAnchor.constraint(equalTo: tabs.bottomAnchor, constant: 8),
+            cleanupHost.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+        ])
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             stack.topAnchor.constraint(equalTo: root.topAnchor),
             stack.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            tableArea.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -18),
+            tableArea.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24),
             usageView.widthAnchor.constraint(equalTo: tableArea.widthAnchor),
             searchBar.widthAnchor.constraint(equalTo: tableArea.widthAnchor),
             popups.widthAnchor.constraint(lessThanOrEqualTo: searchBar.widthAnchor)
@@ -111,13 +132,15 @@ import InventoryCore
         self.totals = totals ?? []
         self.colors = colors
         self.options = options
-        usageView.isHidden = searching || snapshot?.volume == nil
+        usageView.isHidden = searching || cleaning || snapshot?.volume == nil
         if let snapshot, let volume = snapshot.volume, volume.capacity > 0 {
             usageView.rootView = AnyView(VolumeBreakdown(volume: volume, scanned: snapshot.nodes[0].allocated))
         } else {
             usageView.rootView = AnyView(EmptyView())
         }
         matches = []
+        searched = false
+        noResults.isHidden = true
         filterKinds = self.totals.map(\.kind)
         filter.removeAllItems()
         filter.addItem(withTitle: "All kinds")
@@ -172,16 +195,30 @@ import InventoryCore
         changeTab()
     }
 
+    func selectTab(_ index: Int) {
+        guard tabs.selectedSegment != index else { return }
+        tabs.selectedSegment = index
+        changeTab()
+    }
+
+    func showCleanup(_ view: AnyView) {
+        cleanupHost.rootView = view
+    }
+
     func showMatches(_ ids: [Int]) {
         guard searching else { return }
         matches = ids
-        count.stringValue = ids.isEmpty ? "No matching files" : ids.count.formatted() + " items"
+        searched = true
+        count.stringValue = ids.isEmpty ? "" : ids.count.formatted() + " items"
+        noResults.isHidden = !ids.isEmpty
         resultsTable.reloadData()
+        tabChanged?()
         if searching { sync(selected) }
     }
 
     func searchStarted() {
         count.stringValue = "Searching…"
+        noResults.isHidden = true
         matches.removeAll()
         resultsTable.reloadData()
     }
@@ -228,9 +265,14 @@ import InventoryCore
 
     @objc private func changeTab() {
         searchBar.isHidden = !searching
-        usageView.isHidden = searching || snapshot?.volume == nil
+        usageView.isHidden = searching || cleaning || snapshot?.volume == nil
         resultsScroll.isHidden = !searching
         kindsScroll.isHidden = searching
+        noResults.isHidden = !(searching && searched && matches.isEmpty)
+        tableArea.isHidden = cleaning
+        count.isHidden = cleaning
+        cleanupHost.isHidden = !cleaning
+        defer { tabChanged?() }
         if searching {
             updateSearch?()
         } else {
@@ -264,8 +306,8 @@ import InventoryCore
 
     private func configureColumns(_ table: InventoryResultsView, in scroll: NSScrollView, results: Bool) {
         let columns: [(String, String, CGFloat, CGFloat)] = results
-            ? [("name", "Name", 95, 143), ("size", "Size", 63, 78), ("path", "Path", 80, 160)]
-            : [("kind", "Kind", 100, 148), ("size", "Size", 62, 74), ("files", "Files", 48, 57)]
+            ? [("name", "Name", 95, 140), ("size", "Size", 63, 76), ("path", "Folder", 80, 160)]
+            : [("kind", "Kind", 100, 132), ("size", "Size", 62, 74), ("files", "Files", 48, 56)]
         for (id, title, minimumWidth, width) in columns {
             let column = NSTableColumn(identifier: .init(id))
             column.title = title
@@ -285,6 +327,8 @@ import InventoryCore
         table.menu?.delegate = self
         table.setDraggingSourceOperationMask(.copy, forLocal: false)
         table.configureInventoryColumns(results ? "Results" : "Kinds", in: scroll)
+        table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
+        table.tableColumns.first?.resizingMask = [.autoresizingMask, .userResizingMask]
         table.setAccessibilityLabel(results ? "File search results" : "File kind statistics")
         table.activateRow = { [weak self, weak table] in
             guard let table else { return false }
@@ -334,7 +378,7 @@ import InventoryCore
             let id = matches[row]
             switch key {
             case "size": title = formatSize(snapshot.size(of: id, options: options))
-            case "path": title = snapshot.url(for: id).deletingLastPathComponent().path
+            case "path": title = snapshot.displayPath(of: Int(max(0, snapshot.nodes[id].parent)))
             default:
                 title = snapshot.nodes[id].name
                 textColor = .labelColor
@@ -343,35 +387,22 @@ import InventoryCore
             guard shownTotals.indices.contains(row) else { return nil }
             let entry = shownTotals[row]
             if key == "kind" {
-                let dot = NSView()
-                dot.wantsLayer = true
-                dot.layer?.backgroundColor = colors[entry.kind].cgColor
-                dot.layer?.cornerRadius = 4
-                dot.widthAnchor.constraint(equalToConstant: 8).isActive = true
-                dot.heightAnchor.constraint(equalToConstant: 8).isActive = true
-                let label = NSTextField(labelWithString: snapshot.kinds[entry.kind].title)
-                label.lineBreakMode = .byTruncatingTail
-                label.toolTip = label.stringValue
-                label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-                let stack = NSStackView(views: [dot, label])
-                stack.spacing = 6
-                stack.alignment = .centerY
-                return stack
+                let cell = tableView.makeView(withIdentifier: KindCell.identifier, owner: self) as? KindCell ?? KindCell()
+                cell.configure(title: snapshot.kinds[entry.kind].title, color: colors.indices.contains(entry.kind) ? colors[entry.kind] : .systemGray)
+                return cell
             }
             title = key == "files" ? entry.count.formatted() : formatSize(entry.size)
         }
-        let label = NSTextField(labelWithString: title)
-        label.lineBreakMode = .byTruncatingMiddle
-        label.textColor = textColor
-        label.toolTip = title
-        if key == "size" || key == "files" {
-            label.alignment = .right
-            label.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        }
-        return label
+        let cell = tableView.makeView(withIdentifier: TextCell.identifier, owner: self) as? TextCell ?? TextCell()
+        cell.configure(text: title, color: textColor, numeric: key == "size" || key == "files")
+        return cell
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
+        if notification.object as? NSTableView === kindsTable, !searching {
+            if !silent { kindSelected?(selectedKind) }
+            return
+        }
         guard !silent, searching, notification.object as? NSTableView === resultsTable,
               matches.indices.contains(resultsTable.selectedRow) else { return }
         didSelect?(matches[resultsTable.selectedRow])
@@ -391,7 +422,7 @@ import InventoryCore
                 menu.addItem(item)
             }
         } else if !searching, shownTotals.indices.contains(table.clickedRow) {
-            let item = NSMenuItem(title: "Show Files in Selection List", action: #selector(showKind(_:)), keyEquivalent: "")
+            let item = NSMenuItem(title: "Show in Largest Files", action: #selector(showKind(_:)), keyEquivalent: "")
             item.tag = shownTotals[table.clickedRow].kind
             item.target = self
             menu.addItem(item)
@@ -410,5 +441,75 @@ import InventoryCore
            event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
            activateRow?() == true { return }
         super.keyDown(with: event)
+    }
+}
+
+
+@MainActor final class TextCell: NSTableCellView {
+    static let identifier = NSUserInterfaceItemIdentifier("TextCell")
+
+    init() {
+        super.init(frame: .zero)
+        identifier = Self.identifier
+        let field = NSTextField(labelWithString: "")
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        addSubview(field)
+        textField = field
+        NSLayoutConstraint.activate([
+            field.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            field.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2),
+            field.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func configure(text: String, color: NSColor, numeric: Bool, size: CGFloat = 13) {
+        guard let field = textField else { return }
+        field.stringValue = text
+        field.toolTip = text
+        field.textColor = color
+        field.alignment = numeric ? .right : .natural
+        field.lineBreakMode = numeric ? .byTruncatingHead : .byTruncatingMiddle
+        field.font = numeric ? .monospacedDigitSystemFont(ofSize: size - 1, weight: .regular) : .systemFont(ofSize: size)
+    }
+}
+
+@MainActor final class KindCell: NSTableCellView {
+    static let identifier = NSUserInterfaceItemIdentifier("KindCell")
+    private let dot = NSView()
+
+    init() {
+        super.init(frame: .zero)
+        identifier = Self.identifier
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = 4
+        let field = NSTextField(labelWithString: "")
+        field.lineBreakMode = .byTruncatingTail
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        for view in [dot, field] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(view)
+        }
+        textField = field
+        NSLayoutConstraint.activate([
+            dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            dot.centerYAnchor.constraint(equalTo: centerYAnchor),
+            dot.widthAnchor.constraint(equalToConstant: 8),
+            dot.heightAnchor.constraint(equalToConstant: 8),
+            field.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 8),
+            field.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2),
+            field.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func configure(title: String, color: NSColor) {
+        textField?.stringValue = title
+        textField?.toolTip = title
+        dot.layer?.backgroundColor = color.cgColor
+        setAccessibilityLabel(title)
     }
 }
