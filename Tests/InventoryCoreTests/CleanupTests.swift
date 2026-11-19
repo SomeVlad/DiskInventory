@@ -131,3 +131,11 @@ private func temporaryHome() throws -> URL {
     item.status = .done
     #expect(!item.isRunnable)
 }
+
+@Test func vendorFoldersInLibraryAreReviewOnly() throws {
+    guard let vendor = try FileManager.default.contentsOfDirectory(atPath: "/Library").first(where: { ["Google", "Microsoft", "Parallels", "Arturia"].contains($0) }) else { return }
+    #expect(AdviceGuard.refusal(for: "/Library/" + vendor, verdict: .review) == nil)
+    #expect(AdviceGuard.refusal(for: "/Library/" + vendor, verdict: .safe) != nil)
+    #expect(AdviceGuard.refusal(for: "/Library/Fonts", verdict: .review) != nil)
+    #expect(AdviceGuard.refusal(for: "/Library/Application Support", verdict: .review) != nil)
+}
