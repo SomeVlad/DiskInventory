@@ -22,8 +22,9 @@ public struct AdviceItem: Codable, Identifiable, Hashable, Sendable {
     public var action: String?
     public var argument: String?
     public var output: String?
+    public var label: String?
 
-    public init(path: String, size: Int64, verdict: AdviceVerdict, reason: String, action: String? = nil, argument: String? = nil) {
+    public init(path: String, size: Int64, verdict: AdviceVerdict, reason: String, action: String? = nil, argument: String? = nil, label: String? = nil) {
         id = UUID()
         self.path = path
         self.size = size
@@ -33,6 +34,7 @@ public struct AdviceItem: Codable, Identifiable, Hashable, Sendable {
         createdAt = .now
         self.action = action
         self.argument = argument
+        self.label = label ?? action.flatMap { AdviceActions.definition($0)?.title(argument) }
     }
 
     public var isAction: Bool { action != nil }
@@ -40,10 +42,7 @@ public struct AdviceItem: Codable, Identifiable, Hashable, Sendable {
     public var isRemovable: Bool { status == .pending && verdict != .keep && action == nil && !path.isEmpty }
     public var isRunnable: Bool { status == .pending && verdict != .keep && action != nil }
 
-    public var title: String {
-        guard let action, let definition = AdviceActions.definition(action) else { return URL(filePath: path).lastPathComponent }
-        return definition.title(argument)
-    }
+    public var title: String { label ?? URL(filePath: path).lastPathComponent }
 }
 
 public struct AdviceSheet: Codable, Sendable {

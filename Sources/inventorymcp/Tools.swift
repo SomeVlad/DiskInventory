@@ -231,6 +231,7 @@ func adviceJSON(_ sheet: AdviceSheet?) -> [String: Any] {
                 "reason": item.reason,
                 "status": item.status.rawValue,
                 "status_at": item.statusAt as Any,
+                "title": item.title,
                 "action": item.action as Any,
                 "argument": item.argument as Any,
                 "command": item.action.flatMap { AdviceActions.definition($0)?.commandLine(item.argument) } as Any,
@@ -490,6 +491,7 @@ func makeTools(_ store: ScanStore) -> [Tool] {
                             "path": Schema.text("absolute path or ~/…; for an action, optionally the folder it frees space in"),
                             "action": Schema.choice("instead of a path: an allowlisted command the user can run from the app", AdviceActions.all.map(\.id)),
                             "argument": Schema.text("the action's argument: cask name, simulator UDID or runtime identifier"),
+                            "title": Schema.text("short name shown in bold, in the user's language; defaults to the file name or the action's English title"),
                             "verdict": Schema.choice(verdictDescription, AdviceVerdict.allCases.map(\.rawValue)),
                             "reason": Schema.text("why, in the user's language: what it is, what happens after removal, how to get it back"),
                         ],
@@ -518,7 +520,8 @@ func makeTools(_ store: ScanStore) -> [Tool] {
                     }
                     let path = (entry["path"] as? String).map(AdviceGuard.normalize) ?? ""
                     var item = AdviceItem(path: path, size: AdviceActions.estimate(action, argument: argument), verdict: verdict,
-                                          reason: (entry["reason"] as? String) ?? "", action: action, argument: argument)
+                                          reason: (entry["reason"] as? String) ?? "", action: action, argument: argument,
+                                          label: entry["title"] as? String)
                     if item.size == 0, !path.isEmpty { item.size = adviceSize(path, store: store) }
                     accepted.append(item)
                     continue
@@ -533,7 +536,7 @@ func makeTools(_ store: ScanStore) -> [Tool] {
                     continue
                 }
                 accepted.append(AdviceItem(path: path, size: adviceSize(path, store: store), verdict: verdict,
-                                           reason: (entry["reason"] as? String) ?? ""))
+                                           reason: (entry["reason"] as? String) ?? "", label: entry["title"] as? String))
             }
             let append = try params.flag("append", fallback: false)
             let sheet = try AdviceStore.update { sheet in
