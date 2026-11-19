@@ -240,7 +240,7 @@ struct CleanupPanel: View {
                 }
                 if model.coversHome { staleSection }
             }
-            .listStyle(.sidebar)
+            .listStyle(.inset)
             .onChange(of: focus) { _, path in if let path { model.reveal?(path) } }
             .onKeyPress(.space) {
                 guard let focus else { return .ignored }
@@ -270,7 +270,11 @@ struct CleanupPanel: View {
         if let advice = model.advice {
             Section {
                 if !advice.summary.isEmpty {
-                    Text(advice.summary).foregroundStyle(.secondary).padding(.vertical, 2)
+                    Text(advice.summary)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.vertical, 2)
                 }
                 ForEach(advice.items) { item in
                     AdviceRow(model: model, item: item).tag(item.path)
@@ -446,7 +450,11 @@ private struct AdviceRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if !item.reason.isEmpty {
-                    Text(item.reason).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Text(item.reason)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 switch item.status {
                 case .trashed: Text("Moved to the Trash").font(.caption).foregroundStyle(.tertiary)
