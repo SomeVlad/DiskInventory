@@ -109,6 +109,8 @@ import InventoryCore
         stack.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
         stack.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(stack)
+        cleanupHost.sizingOptions = []
+        noResults.sizingOptions = []
         cleanupHost.translatesAutoresizingMaskIntoConstraints = false
         cleanupHost.isHidden = true
         root.addSubview(cleanupHost)

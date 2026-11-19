@@ -116,6 +116,7 @@ private struct PlaceholderView: View {
         highlight.autoresizingMask = [.width, .height]
         highlight.wantsLayer = true
         addSubview(highlight)
+        overlay.sizingOptions = []
         overlay.translatesAutoresizingMaskIntoConstraints = false
         addSubview(overlay)
         NSLayoutConstraint.activate([
