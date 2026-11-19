@@ -1200,6 +1200,15 @@ import SwiftUI
         return menu
     }
 
+    func captureWindow(to url: URL) -> Bool {
+        typealias Capture = @convention(c) (CGRect, UInt32, UInt32, UInt32) -> Unmanaged<CGImage>?
+        guard let window, let handle = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY),
+              let symbol = dlsym(handle, "CGWindowListCreateImage"),
+              let image = unsafeBitCast(symbol, to: Capture.self)(.null, 1 << 3, UInt32(window.windowNumber), 1 << 0 | 1 << 3)?.takeRetainedValue(),
+              let data = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else { return false }
+        return (try? data.write(to: url, options: .atomic)) != nil
+    }
+
     func captureContent(to url: URL) {
         guard let view = window?.contentView else { return }
         view.layoutSubtreeIfNeeded()

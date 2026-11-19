@@ -9,7 +9,7 @@
 ## Быстрый старт
 
 ```sh
-git clone git@github.com:kpeeem/DiskInventory.git
+git clone https://github.com/kpeeem/DiskInventory.git
 ```
 
 ```sh

@@ -104,6 +104,7 @@ struct VolumePicker: View {
     var testTrash = false
     var testLayout = false
     var testSettingsDomain: String?
+    var screenshots: (folder: URL, directory: URL)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenu()
@@ -138,7 +139,9 @@ struct VolumePicker: View {
             MainActor.assumeIsolated { self?.showCleanup() }
         })
 
-        if testTrash {
+        if let screenshots {
+            runScreenshots(screenshots.folder, to: screenshots.directory)
+        } else if testTrash {
             runTrashSmokeTest()
         } else if let testLocation {
             if testLayout {
@@ -223,7 +226,7 @@ struct VolumePicker: View {
         document.showWindow(nil)
         document.window?.makeKeyAndOrderFront(nil)
         document.scan(restore: false)
-        if testLocation == nil, !testTrash { NSDocumentController.shared.noteNewRecentDocumentURL(url) }
+        if testLocation == nil, !testTrash, screenshots == nil { NSDocumentController.shared.noteNewRecentDocumentURL(url) }
         return document
     }
 
@@ -572,6 +575,29 @@ struct VolumePicker: View {
             print("Header resize and reorder in three tables, both split dividers, layout restoration, Return activation, search filter and selection checks passed.")
             fflush(nil)
             exit(EXIT_SUCCESS)
+        }
+    }
+
+    private func runScreenshots(_ location: URL, to directory: URL) {
+        Task { @MainActor in
+            let document = open(location)
+            document.window?.setFrame(NSRect(x: 80, y: 40, width: 1280, height: 940), display: true)
+            let deadline = ContinuousClock.now + .seconds(120)
+            while !document.testReady, ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            let shots: [(name: String, appearance: NSAppearance.Name, cleanup: Bool)] = [
+                ("main-window", .aqua, false), ("main-window-dark", .darkAqua, false), ("cleanup-tab", .aqua, true),
+            ]
+            for shot in shots where document.testReady {
+                NSApp.appearance = NSAppearance(named: shot.appearance)
+                if shot.cleanup { document.cleanUp() }
+                try? await Task.sleep(for: .seconds(2))
+                guard document.captureWindow(to: directory.appending(path: shot.name + ".png")) else { break }
+                print(shot.name)
+            }
+            fflush(nil)
+            exit(document.testReady ? EXIT_SUCCESS : EXIT_FAILURE)
         }
     }
 

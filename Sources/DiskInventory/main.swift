@@ -25,6 +25,9 @@ if args.count >= 3, ["--scan", "--fts", "--baseline"].contains(args[1]) {
     let app = NSApplication.shared
     let delegate = ApplicationController()
     delegate.testTrash = args.dropFirst().first == "--trash-smoke-test"
+    if args.count >= 4, args[1] == "--screenshots" {
+        delegate.screenshots = (URL(filePath: args[2], directoryHint: .isDirectory), URL(filePath: args[3], directoryHint: .isDirectory))
+    }
     if args.count >= 3, ["--smoke-test", "--settings-smoke-test", "--layout-smoke-test"].contains(args[1]) {
         delegate.testLocation = URL(filePath: args[2], directoryHint: .isDirectory)
         if args[1] == "--layout-smoke-test" {
