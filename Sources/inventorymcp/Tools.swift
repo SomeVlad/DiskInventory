@@ -220,7 +220,7 @@ func adviceJSON(_ sheet: AdviceSheet?) -> [String: Any] {
         "title": sheet.title,
         "summary": sheet.summary,
         "updated_at": sheet.updatedAt,
-        "pending_size_h": human(pending.reduce(0) { $0 + $1.size }),
+        "pending_size_h": human(pending.filter { $0.verdict != .keep }.reduce(0) { $0 + $1.size }),
         "items": sheet.items.map { item in
             [
                 "id": item.id.uuidString,
@@ -551,7 +551,7 @@ func makeTools(_ store: ScanStore) -> [Tool] {
             let opened = try params.flag("show", fallback: true) ? showCleanupInApp() : nil
             return [
                 "accepted": accepted.count,
-                "accepted_size_h": human(accepted.reduce(0) { $0 + $1.size }),
+                "accepted_size_h": human(accepted.filter { $0.verdict != .keep }.reduce(0) { $0 + $1.size }),
                 "refused": refused,
                 "opened": opened as Any,
                 "advice": adviceJSON(sheet),
